@@ -1,6 +1,7 @@
 'use strict'
 
-const {Patch, textExtent, textPositionForOffset, textOffsetForPoint, traverse, traversal, cmp} = require('./patch')
+const {Patch, textExtent, textPositionForOffset, textOffsetForPoint, traverse, cmp} = require('./patch')
+const PieceTree = require('./piece-tree')
 
 let _jsdiff = null
 function jsdiff () {
@@ -283,12 +284,14 @@ class TextBuffer {
     if (typeof text !== 'string') text = String(text)
     // Base text – never mutated after construction (tracks "unmodified" state)
     this._baseText = text
-    // Current text – mutable
-    this._text = text
+    // Current text is authoritative in a balanced piece tree. Cold paths
+    // materialize it lazily through the compatibility accessor below.
+    this._tree = new PieceTree(text)
     // We keep a simple change layer on top: we store the accumulated Patch
     // from the original base text to the current text. This is used for
     // isModified() and getInvertedChanges().
     this._patch = new Patch()
+    this._patchDirty = false
     // Monotonically increasing counter; bumped on every save() call so that
     // concurrent saves can tell which snapshot is most recent.
     this._saveGeneration = 0
@@ -297,6 +300,12 @@ class TextBuffer {
     // character offset of the start of row i. Invalidated by setting to null
     // on any text mutation.
     this._lineStarts = null
+  }
+
+  get _text () { return this._tree.getText() }
+  set _text (text) {
+    if (this._tree) this._tree.reset(text)
+    else this._tree = new PieceTree(text)
   }
 
   _getLineStarts () {
@@ -378,17 +387,7 @@ class TextBuffer {
   // Equivalent to textPositionForOffset(this._text, offset) but without scanning.
   _positionForOffset (offset) {
     if (offset <= 0) return {row: 0, column: 0}
-    const text = this._text
-    if (offset > text.length) offset = text.length
-    const starts = this._getLineStarts()
-    let lo = 0
-    let hi = starts.length - 1
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >>> 1
-      if (starts[mid] <= offset) lo = mid
-      else hi = mid - 1
-    }
-    return {row: lo, column: offset - starts[lo]}
+    return this._tree.positionForOffset(offset)
   }
 
   // Equivalent to textOffsetForPoint(this._text, point), in O(1).
@@ -396,26 +395,19 @@ class TextBuffer {
   // point is reached, return that offset, otherwise fall through to text.length
   // ("unreachable point" fallback). \r is counted as a regular column character.
   _offsetForPosition (point) {
-    const text = this._text
-    const starts = this._getLineStarts()
     let row = point.row
     let column = point.column
     if (row < 0) { row = 0; column = 0 }
     if (column < 0) column = 0
-    if (row >= starts.length) return text.length
-    const lineStart = starts[row]
-    const hasNextLine = row + 1 < starts.length
-    // For non-last rows, the line content (including any trailing \r) ends just
-    // before the '\n' at starts[row+1] - 1. A column larger than that content
-    // length is "unreachable" → fall through to text.length, matching the
-    // original walking implementation.
+    if (row >= this._tree.lineCount) return this._tree.length
+    const lineStart = this._tree.lineStart(row)
+    const hasNextLine = row + 1 < this._tree.lineCount
     if (hasNextLine) {
-      const lineLen = starts[row + 1] - 1 - lineStart
-      if (column > lineLen) return text.length
+      const lineLen = this._tree.lineStart(row + 1) - 1 - lineStart
+      if (column > lineLen) return this._tree.length
       return lineStart + column
     }
-    // Last row: clamp to text.length.
-    const lineLen = text.length - lineStart
+    const lineLen = this._tree.length - lineStart
     if (column > lineLen) column = lineLen
     return lineStart + column
   }
@@ -430,14 +422,10 @@ class TextBuffer {
 
   setText (newText) {
     if (typeof newText !== 'string') newText = String(newText)
-    const oldText = this._text
-    const oldExtent = textExtent(oldText)
-    const newExtent = textExtent(newText)
     // Replace entire content
     this._text = newText
     this._invalidateLineStarts()
-    this._patch.splice(ZERO, oldExtent, newExtent, oldText, newText)
-    this._patch._removeNoopChange()
+    this._patchDirty = true
   }
 
   setTextInRange (range, newText) {
@@ -448,19 +436,15 @@ class TextBuffer {
     const s = cmp(start, end) <= 0 ? start : end
     const e = cmp(start, end) <= 0 ? end : start
 
-    const oldText = this._getTextInRange(s, e)
-    const oldExtent = traversal(e, s)
-    const newExtent = textExtent(newText)
-
     // Build new full text
     const offset1 = this._offsetForPosition(s)
     const offset2 = this._offsetForPosition(e)
-    this._text = this._text.slice(0, offset1) + newText + this._text.slice(offset2)
-    this._patchLineStarts(offset1, offset2, newText)
+    this._tree.replace(offset1, offset2, newText)
+    this._invalidateLineStarts()
 
-    // Update patch
-    this._patch.splice(s, oldExtent, newExtent, oldText, newText)
-    this._patch._removeNoopChange()
+    // Update patch lazily; coalescing a full-document replacement on every
+    // keystroke would otherwise copy the entire base piece.
+    this._patchDirty = true
   }
 
   getTextInRange (range) {
@@ -473,7 +457,7 @@ class TextBuffer {
   _getTextInRange (start, end) {
     const offset1 = this._offsetForPosition(start)
     const offset2 = this._offsetForPosition(end)
-    return this._text.slice(offset1, offset2)
+    return this._tree.substring(offset1, offset2)
   }
 
   // ---------------------------------------------------------------------------
@@ -481,18 +465,16 @@ class TextBuffer {
   // ---------------------------------------------------------------------------
 
   getLength () {
-    return this._text.length
+    return this._tree.length
   }
 
   getExtent () {
-    const text = this._text
-    const starts = this._getLineStarts()
-    const lastRow = starts.length - 1
-    return {row: lastRow, column: text.length - starts[lastRow]}
+    const lastRow = this._tree.lineCount - 1
+    return {row: lastRow, column: this._tree.length - this._tree.lineStart(lastRow)}
   }
 
   getLineCount () {
-    return this._getLineStarts().length
+    return this._tree.lineCount
   }
 
   // ---------------------------------------------------------------------------
@@ -670,6 +652,7 @@ class TextBuffer {
     this._text = text
     this._invalidateLineStarts()
     this._patch = new Patch()
+    this._patchDirty = false
     this._saveGeneration = 0
     this._baseGeneration = 0
   }
@@ -715,6 +698,10 @@ class TextBuffer {
   // ---------------------------------------------------------------------------
 
   serializeChanges () {
+    if (this._patchDirty) {
+      this._patch = computeTextDiff(this._baseText, this._text)
+      this._patchDirty = false
+    }
     return this._patch.serialize()
   }
 
@@ -732,6 +719,7 @@ class TextBuffer {
       this._invalidateLineStarts()
     }
     this._patch = patch
+    this._patchDirty = false
   }
 
   // ---------------------------------------------------------------------------
@@ -1230,6 +1218,7 @@ class TextBuffer {
       this._baseText = newText
       this._invalidateLineStarts()
       this._patch = new Patch()
+      this._patchDirty = false
 
       return resultPatch
     })
@@ -1298,6 +1287,7 @@ class TextBuffer {
           this._baseGeneration = generation
           if (this._text === snapshot) {
             this._patch = new Patch()
+            this._patchDirty = false
           }
         }
         resolve()
