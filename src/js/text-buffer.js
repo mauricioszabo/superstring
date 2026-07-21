@@ -1,6 +1,6 @@
 'use strict'
 
-const {Patch, textExtent, textPositionForOffset, textOffsetForPoint, traverse, cmp} = require('./patch')
+const {Patch, textExtent, textPositionForOffset, textOffsetForPoint, traverse, traversal, cmp} = require('./patch')
 const PieceTree = require('./piece-tree')
 
 let _jsdiff = null
@@ -291,7 +291,9 @@ class TextBuffer {
     // from the original base text to the current text. This is used for
     // isModified() and getInvertedChanges().
     this._patch = new Patch()
-    this._patchDirty = false
+    // Replaying these exact splices later preserves Patch's incremental
+    // coalescing semantics without copying a large existing change per edit.
+    this._pendingPatchOperations = []
     // Monotonically increasing counter; bumped on every save() call so that
     // concurrent saves can tell which snapshot is most recent.
     this._saveGeneration = 0
@@ -422,10 +424,17 @@ class TextBuffer {
 
   setText (newText) {
     if (typeof newText !== 'string') newText = String(newText)
+    const oldText = this._text
     // Replace entire content
     this._text = newText
     this._invalidateLineStarts()
-    this._patchDirty = true
+    this._pendingPatchOperations.push({
+      start: ZERO,
+      oldExtent: textExtent(oldText),
+      newExtent: textExtent(newText),
+      oldText,
+      newText
+    })
   }
 
   setTextInRange (range, newText) {
@@ -436,15 +445,19 @@ class TextBuffer {
     const s = cmp(start, end) <= 0 ? start : end
     const e = cmp(start, end) <= 0 ? end : start
 
-    // Build new full text
     const offset1 = this._offsetForPosition(s)
     const offset2 = this._offsetForPosition(e)
+    const oldText = this._tree.substring(offset1, offset2)
     this._tree.replace(offset1, offset2, newText)
     this._invalidateLineStarts()
 
-    // Update patch lazily; coalescing a full-document replacement on every
-    // keystroke would otherwise copy the entire base piece.
-    this._patchDirty = true
+    this._pendingPatchOperations.push({
+      start: s,
+      oldExtent: traversal(e, s),
+      newExtent: textExtent(newText),
+      oldText,
+      newText
+    })
   }
 
   getTextInRange (range) {
@@ -652,7 +665,7 @@ class TextBuffer {
     this._text = text
     this._invalidateLineStarts()
     this._patch = new Patch()
-    this._patchDirty = false
+    this._pendingPatchOperations = []
     this._saveGeneration = 0
     this._baseGeneration = 0
   }
@@ -698,11 +711,17 @@ class TextBuffer {
   // ---------------------------------------------------------------------------
 
   serializeChanges () {
-    if (this._patchDirty) {
-      this._patch = computeTextDiff(this._baseText, this._text)
-      this._patchDirty = false
-    }
+    this._flushPendingPatchOperations()
     return this._patch.serialize()
+  }
+
+  _flushPendingPatchOperations () {
+    for (const operation of this._pendingPatchOperations) {
+      this._patch.splice(operation.start, operation.oldExtent, operation.newExtent,
+        operation.oldText, operation.newText)
+      this._patch._removeNoopChange()
+    }
+    this._pendingPatchOperations.length = 0
   }
 
   deserializeChanges (buffer) {
@@ -715,11 +734,11 @@ class TextBuffer {
       const newText = change.newText || ''
       const offset1 = this._offsetForPosition(s)
       const offset2 = this._offsetForPosition(e)
-      this._text = this._text.slice(0, offset1) + newText + this._text.slice(offset2)
+      this._tree.replace(offset1, offset2, newText)
       this._invalidateLineStarts()
     }
     this._patch = patch
-    this._patchDirty = false
+    this._pendingPatchOperations = []
   }
 
   // ---------------------------------------------------------------------------
@@ -1218,7 +1237,7 @@ class TextBuffer {
       this._baseText = newText
       this._invalidateLineStarts()
       this._patch = new Patch()
-      this._patchDirty = false
+      this._pendingPatchOperations = []
 
       return resultPatch
     })
@@ -1287,7 +1306,7 @@ class TextBuffer {
           this._baseGeneration = generation
           if (this._text === snapshot) {
             this._patch = new Patch()
-            this._patchDirty = false
+            this._pendingPatchOperations = []
           }
         }
         resolve()
