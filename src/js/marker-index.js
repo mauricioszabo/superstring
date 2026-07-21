@@ -48,7 +48,9 @@ function makeNode (parent, leftExtent) {
     rightMarkerIds: new Set(),
     startMarkerIds: new Set(),
     endMarkerIds: new Set(),
-    priority: 0
+    priority: 0,
+    cachedPosition: null,
+    cachedGeneration: -1
   }
 }
 
@@ -81,7 +83,8 @@ class Iterator {
   }
 
   cacheNodePosition () {
-    this.markerIndex._nodePositionCache.set(this.node, this.nodePosition)
+    this.node.cachedPosition = this.nodePosition
+    this.node.cachedGeneration = this.markerIndex._generation
   }
 
   descendLeft () {
@@ -275,14 +278,14 @@ class Iterator {
 
   checkIntersection (start, end, result) {
     if (cmp(this.leftAncestorPosition, end) <= 0 && cmp(start, this.nodePosition) <= 0) {
-      for (const id of this.node.leftMarkerIds) result.add(id)
+      for (const id of this.node.leftMarkerIds) result.push(id)
     }
     if (cmp(start, this.nodePosition) <= 0 && cmp(this.nodePosition, end) <= 0) {
-      for (const id of this.node.startMarkerIds) result.add(id)
-      for (const id of this.node.endMarkerIds) result.add(id)
+      for (const id of this.node.startMarkerIds) result.push(id)
+      for (const id of this.node.endMarkerIds) result.push(id)
     }
     if (cmp(this.nodePosition, end) <= 0 && cmp(start, this.rightAncestorPosition) <= 0) {
-      for (const id of this.node.rightMarkerIds) result.add(id)
+      for (const id of this.node.rightMarkerIds) result.push(id)
     }
   }
 
@@ -326,7 +329,7 @@ class Iterator {
     while (this.node && cmp(this.nodePosition, end) <= 0) {
       for (const id of this.node.startMarkerIds) started.add(id)
       for (const id of this.node.endMarkerIds) {
-        if (started.has(id)) result.add(id)
+        if (started.has(id)) result.push(id)
       }
       this.cacheNodePosition()
       this.moveToSuccessor()
@@ -340,7 +343,7 @@ class Iterator {
     this.seekToFirstNodeGte(start)
 
     while (this.node && cmp(this.nodePosition, end) <= 0) {
-      for (const id of this.node.startMarkerIds) result.add(id)
+      for (const id of this.node.startMarkerIds) result.push(id)
       this.cacheNodePosition()
       this.moveToSuccessor()
     }
@@ -353,7 +356,7 @@ class Iterator {
     this.seekToFirstNodeGte(start)
 
     while (this.node && cmp(this.nodePosition, end) <= 0) {
-      for (const id of this.node.endMarkerIds) result.add(id)
+      for (const id of this.node.endMarkerIds) result.push(id)
       this.cacheNodePosition()
       this.moveToSuccessor()
     }
@@ -447,7 +450,7 @@ class MarkerIndex {
     this._endNodesById = new Map()
     this.iterator = new Iterator(this)
     this._exclusiveMarkerIds = new Set()
-    this._nodePositionCache = new Map()
+    this._generation = 0
   }
 
   _generateRandomNumber () {
@@ -455,8 +458,8 @@ class MarkerIndex {
   }
 
   _getNodePosition (node) {
-    if (this._nodePositionCache.has(node)) {
-      return this._nodePositionCache.get(node)
+    if (node.cachedGeneration === this._generation) {
+      return node.cachedPosition
     }
     let position = node.leftExtent
     let current = node
@@ -466,7 +469,8 @@ class MarkerIndex {
       }
       current = current.parent
     }
-    this._nodePositionCache.set(node, position)
+    node.cachedPosition = position
+    node.cachedGeneration = this._generation
     return position
   }
 
@@ -580,7 +584,6 @@ class MarkerIndex {
   }
 
   _deleteNode (node) {
-    this._nodePositionCache.delete(node)
     node.priority = Infinity
 
     this._bubbleNodeDown(node)
@@ -590,17 +593,6 @@ class MarkerIndex {
       else node.parent.right = null
     } else {
       this.root = null
-    }
-  }
-
-  _deleteSubtree (node) {
-    if (!node) return
-    const stack = [node]
-    while (stack.length > 0) {
-      const n = stack.pop()
-      this._nodePositionCache.delete(n)
-      if (n.left) stack.push(n.left)
-      if (n.right) stack.push(n.right)
     }
   }
 
@@ -651,8 +643,10 @@ class MarkerIndex {
     const startNode = this.iterator.insertMarkerStart(id, start, end)
     const endNode = this.iterator.insertMarkerEnd(id, start, end)
 
-    this._nodePositionCache.set(startNode, start)
-    this._nodePositionCache.set(endNode, end)
+    startNode.cachedPosition = start
+    startNode.cachedGeneration = this._generation
+    endNode.cachedPosition = end
+    endNode.cachedGeneration = this._generation
 
     startNode.startMarkerIds.add(id)
     endNode.endMarkerIds.add(id)
@@ -717,7 +711,7 @@ class MarkerIndex {
   }
 
   splice (start, oldExtent, newExtent) {
-    this._nodePositionCache.clear()
+    this._generation++
 
     const invalidated = {
       touch: new Set(),
@@ -802,7 +796,6 @@ class MarkerIndex {
 
     // Delete subtree between startNode and endNode
     if (startNode.right) {
-      this._deleteSubtree(startNode.right)
       startNode.right = null
     }
 
@@ -866,18 +859,20 @@ class MarkerIndex {
   }
 
   findIntersecting (start, end) {
-    const result = new Set()
+    const result = []
     this.iterator.findIntersecting(start, end, result)
-    return result
+    return new Set(result)
   }
 
   findContaining (start, end) {
-    const containingStart = new Set()
-    this.iterator.findIntersecting(start, start, containingStart)
+    const containingStartIds = []
+    this.iterator.findIntersecting(start, start, containingStartIds)
+    const containingStart = new Set(containingStartIds)
     if (cmp(end, start) === 0) return containingStart
 
-    const containingEnd = new Set()
-    this.iterator.findIntersecting(end, end, containingEnd)
+    const containingEndIds = []
+    this.iterator.findIntersecting(end, end, containingEndIds)
+    const containingEnd = new Set(containingEndIds)
 
     const result = new Set()
     for (const id of containingStart) {
@@ -887,15 +882,15 @@ class MarkerIndex {
   }
 
   findContainedIn (start, end) {
-    const result = new Set()
+    const result = []
     this.iterator.findContainedIn(start, end, result)
-    return result
+    return new Set(result)
   }
 
   findStartingIn (start, end) {
-    const result = new Set()
+    const result = []
     this.iterator.findStartingIn(start, end, result)
-    return result
+    return new Set(result)
   }
 
   findStartingAt (position) {
@@ -903,9 +898,9 @@ class MarkerIndex {
   }
 
   findEndingIn (start, end) {
-    const result = new Set()
+    const result = []
     this.iterator.findEndingIn(start, end, result)
-    return result
+    return new Set(result)
   }
 
   findEndingAt (position) {
