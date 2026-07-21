@@ -1,11 +1,12 @@
 'use strict'
 
 // Storage adapter that backs TextBuffer with the piece-tree text buffer
-// extracted from VS Code (npm: vscode-textbuffer, MIT). All coordinates
-// exposed by this class are superstring's: 0-based {row, column} points and
-// 0-based character offsets. The piece tree's 1-based lineNumber/column
-// never leak past this file, and this is the only file allowed to require
-// vscode-textbuffer — swapping the backend means reimplementing this class.
+// vendored from the VS Code monorepo (vendor/vscode-piecetree, MIT; refresh
+// with script/update-vendored-piece-tree.js). All coordinates exposed by
+// this class are superstring's: 0-based {row, column} points and 0-based
+// character offsets. The piece tree's 1-based lineNumber/column never leak
+// past this file, and this is the only file allowed to require the vendored
+// module — swapping the backend means reimplementing this class.
 //
 // The one semantic mismatch between the two worlds is the lone `\r`: the
 // piece tree treats a `\r` not followed by `\n` as a line break, superstring
@@ -21,27 +22,20 @@
 //   the same cost profile the previous string-based implementation paid
 //   for every edit, so this is never a regression.
 
-const {PieceTreeTextBufferBuilder} = require('vscode-textbuffer')
-const {Range} = require('vscode-textbuffer/lib/common/range')
-
-// DefaultEndOfLine.LF — a TypeScript const enum, absent from the compiled
-// exports, so the numeric value is used directly.
-const DEFAULT_EOL_LF = 1
+const {PieceTreeBase, Range} = require('../../vendor/vscode-piecetree')
 
 const CR = 13
 const LF = 10
 
-// The tree is always built empty and filled with a single insert() rather
-// than through acceptChunk(): the v1.0.0 builder strips a leading UTF-8 BOM
-// from the content, and its held-back-`\r` machinery duplicates the
-// character when the entire input is one `\r` (or lone high surrogate).
-// insert() has neither problem and splits oversized text into
+// The tree is built empty and filled with a single insert() rather than
+// through VS Code's chunk builder: the builder strips a leading UTF-8 BOM
+// from the content and is wired to the full ITextBuffer stack, while
+// insert() takes the text verbatim and splits oversized input into
 // AverageBufferSize chunks itself, with correct handling of CRLF and
-// surrogate pairs at chunk boundaries. finish(false): never normalize line
-// endings — mixed CRLF/LF/lone-CR content must round-trip byte for byte.
+// surrogate pairs at chunk boundaries. eolNormalized stays false — mixed
+// CRLF/LF/lone-CR content must round-trip byte for byte.
 function buildTree (text) {
-  const builder = new PieceTreeTextBufferBuilder()
-  const tree = builder.finish(false).create(DEFAULT_EOL_LF)
+  const tree = new PieceTreeBase([], '\n', false)
   if (text.length > 0) tree.insert(0, text, false)
   return tree
 }
@@ -142,13 +136,13 @@ class PieceTreeText {
   charCodeAt (offset) {
     if (offset < 0 || offset >= this._tree.getLength()) return -1
     if (this._cachedText !== null) return this._cachedText.charCodeAt(offset)
-    return this.slice(offset, offset + 1).charCodeAt(0)
+    return this._tree.getCharCode(offset)
   }
 
   charAt (offset) {
     if (offset < 0 || offset >= this._tree.getLength()) return ''
     if (this._cachedText !== null) return this._cachedText[offset]
-    return this.slice(offset, offset + 1)
+    return String.fromCharCode(this._tree.getCharCode(offset))
   }
 
   // ---------------------------------------------------------------------
@@ -228,10 +222,11 @@ class PieceTreeText {
     return this._flatLineText(row)
   }
 
-  // The tree's own getLineLength is unusable here: at v1.0.0 it subtracts
-  // the buffer's *default* EOL length instead of the line's actual
-  // terminator, over-counting CRLF lines by one. getLineContent strips the
-  // real terminator (and caches the last visited line), so both length and
+  // The tree's own getLineLength is unusable here: it subtracts the
+  // buffer's *default* EOL length instead of the line's actual terminator
+  // (VS Code only calls it on EOL-normalized buffers), over-counting CRLF
+  // lines by one in our non-normalized tree. getLineContent strips the real
+  // terminator (and caches the last visited line), so both length and
   // ending are derived from it instead.
   lineLengthForRow (row) {
     const lineCount = this.lineCount

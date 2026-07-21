@@ -32,8 +32,7 @@
   "homepage": "https://github.com/pulsar-edit/superstring",
   "dependencies": {
     "diff": "^1.4.0",
-    "iconv-lite": "^0.6.3",
-    "vscode-textbuffer": "1.0.0"
+    "iconv-lite": "^0.6.3"
   },
   "devDependencies": {
     "chai": "^2.0.0",
@@ -41,6 +40,7 @@
     "random-seed": "^0.2.0",
     "standard": "^4.5.4",
     "temp": "^0.8.3",
+    "typescript": "^7.0.2",
     "unzip": "^0.1.11"
   },
   "standard": {

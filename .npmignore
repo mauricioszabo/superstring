@@ -4,9 +4,12 @@
 !LICENSE
 !index.js
 !browser.js
+!src/js/*
 !src/core/*
 !src/bindings/*.h
 !src/bindings/*.cc
+
+!vendor/vscode-piecetree/**
 
 !script/fetch-libiconv-61.sh
 
