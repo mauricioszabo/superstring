@@ -14,7 +14,19 @@ class Piece {
     this.lines = upperBound(this.lineStarts, end) - upperBound(this.lineStarts, start)
   }
 
-  slice (start, end) { return new Piece(this.text, this.start + start, this.start + end, this.lineStarts) }
+  slice (start, end) {
+    const absoluteStart = this.start + start
+    const absoluteEnd = this.start + end
+    const sliceLength = absoluteEnd - absoluteStart
+    // Avoid retaining a huge source and newline index for a tiny survivor.
+    // Conservative gates keep ordinary splits allocation-free.
+    if (this.text.length >= 64 * 1024 && sliceLength <= 16 * 1024 &&
+        sliceLength * 16 <= this.text.length) {
+      const text = this.text.slice(absoluteStart, absoluteEnd)
+      return new Piece(text, 0, text.length)
+    }
+    return new Piece(this.text, absoluteStart, absoluteEnd, this.lineStarts)
+  }
 }
 
 class Node {
