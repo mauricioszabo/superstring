@@ -1,6 +1,7 @@
 'use strict'
 
 const {Patch, textExtent, textPositionForOffset, textOffsetForPoint, traverse, traversal, cmp} = require('./patch')
+const {PieceTreeText} = require('./piece-tree-text')
 
 let _jsdiff = null
 function jsdiff () {
@@ -283,8 +284,10 @@ class TextBuffer {
     if (typeof text !== 'string') text = String(text)
     // Base text – never mutated after construction (tracks "unmodified" state)
     this._baseText = text
-    // Current text – mutable
-    this._text = text
+    // Current text – mutable, stored in a piece tree (see piece-tree-text.js).
+    // The adapter exposes 0-based offsets/points with the same clamping and
+    // line-splitting semantics the previous string-based storage had.
+    this._storage = new PieceTreeText(text)
     // We keep a simple change layer on top: we store the accumulated Patch
     // from the original base text to the current text. This is used for
     // isModified() and getInvertedChanges().
@@ -293,131 +296,14 @@ class TextBuffer {
     // concurrent saves can tell which snapshot is most recent.
     this._saveGeneration = 0
     this._baseGeneration = 0
-    // Cached array of line-start offsets, lazily built. Index i holds the
-    // character offset of the start of row i. Invalidated by setting to null
-    // on any text mutation.
-    this._lineStarts = null
   }
 
-  _getLineStarts () {
-    if (this._lineStarts) return this._lineStarts
-    const text = this._text
-    const starts = [0]
-    for (let i = 0; i < text.length; i++) {
-      if (text.charCodeAt(i) === 10) starts.push(i + 1)
-    }
-    this._lineStarts = starts
-    return starts
-  }
-
-  _invalidateLineStarts () {
-    this._lineStarts = null
-  }
-
-  // Incrementally update the cached line-starts array after replacing
-  // this._text[offset1, offset2) with newText, instead of discarding the
-  // whole array and rescanning the entire (potentially huge) document on
-  // the next access. Only the newlines inside newText need to be found;
-  // every line start before offset1 is untouched, and every one after
-  // offset2 just shifts by the length delta.
-  //
-  // No-op (falls back to a full invalidation) if the cache isn't already
-  // built — there's nothing to patch incrementally in that case.
-  _patchLineStarts (offset1, offset2, newText) {
-    const starts = this._lineStarts
-    if (!starts) return
-
-    // Index of the first line-start after offset1 (i.e. first row whose
-    // start is strictly greater than offset1). Rows [0, cutStart) are kept
-    // as-is.
-    let cutStart = starts.length
-    {
-      let lo = 0
-      let hi = starts.length
-      while (lo < hi) {
-        const mid = (lo + hi) >>> 1
-        if (starts[mid] <= offset1) lo = mid + 1
-        else hi = mid
-      }
-      cutStart = lo
-    }
-
-    // Index of the first line-start strictly after offset2. Rows
-    // [cutEnd, end) survive the splice, just shifted by delta. A line-start
-    // exactly at offset2 is dropped here too — it marked the boundary of the
-    // deleted region, and the tail now begins right after the inserted text.
-    let cutEnd = starts.length
-    {
-      let lo = cutStart
-      let hi = starts.length
-      while (lo < hi) {
-        const mid = (lo + hi) >>> 1
-        if (starts[mid] <= offset2) lo = mid + 1
-        else hi = mid
-      }
-      cutEnd = lo
-    }
-
-    const delta = newText.length - (offset2 - offset1)
-    const inserted = []
-    for (let i = 0; i < newText.length; i++) {
-      if (newText.charCodeAt(i) === 10) inserted.push(offset1 + i + 1)
-    }
-
-    const tail = starts.length - cutEnd
-    const newLength = cutStart + inserted.length + tail
-    const result = new Array(newLength)
-    for (let i = 0; i < cutStart; i++) result[i] = starts[i]
-    for (let i = 0; i < inserted.length; i++) result[cutStart + i] = inserted[i]
-    for (let i = 0; i < tail; i++) result[cutStart + inserted.length + i] = starts[cutEnd + i] + delta
-
-    this._lineStarts = result
-  }
-
-  // O(log lines) position lookup against this._text using the cached line-start index.
-  // Equivalent to textPositionForOffset(this._text, offset) but without scanning.
   _positionForOffset (offset) {
-    if (offset <= 0) return {row: 0, column: 0}
-    const text = this._text
-    if (offset > text.length) offset = text.length
-    const starts = this._getLineStarts()
-    let lo = 0
-    let hi = starts.length - 1
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >>> 1
-      if (starts[mid] <= offset) lo = mid
-      else hi = mid - 1
-    }
-    return {row: lo, column: offset - starts[lo]}
+    return this._storage.positionForOffset(offset)
   }
 
-  // Equivalent to textOffsetForPoint(this._text, point), in O(1).
-  // Original semantics: walk the text counting columns per line; if the requested
-  // point is reached, return that offset, otherwise fall through to text.length
-  // ("unreachable point" fallback). \r is counted as a regular column character.
   _offsetForPosition (point) {
-    const text = this._text
-    const starts = this._getLineStarts()
-    let row = point.row
-    let column = point.column
-    if (row < 0) { row = 0; column = 0 }
-    if (column < 0) column = 0
-    if (row >= starts.length) return text.length
-    const lineStart = starts[row]
-    const hasNextLine = row + 1 < starts.length
-    // For non-last rows, the line content (including any trailing \r) ends just
-    // before the '\n' at starts[row+1] - 1. A column larger than that content
-    // length is "unreachable" → fall through to text.length, matching the
-    // original walking implementation.
-    if (hasNextLine) {
-      const lineLen = starts[row + 1] - 1 - lineStart
-      if (column > lineLen) return text.length
-      return lineStart + column
-    }
-    // Last row: clamp to text.length.
-    const lineLen = text.length - lineStart
-    if (column > lineLen) column = lineLen
-    return lineStart + column
+    return this._storage.offsetForPosition(point)
   }
 
   // ---------------------------------------------------------------------------
@@ -425,17 +311,16 @@ class TextBuffer {
   // ---------------------------------------------------------------------------
 
   getText () {
-    return this._text
+    return this._storage.getText()
   }
 
   setText (newText) {
     if (typeof newText !== 'string') newText = String(newText)
-    const oldText = this._text
-    const oldExtent = textExtent(oldText)
+    const oldText = this._storage.getText()
+    const oldExtent = this._storage.getExtent()
     const newExtent = textExtent(newText)
     // Replace entire content
-    this._text = newText
-    this._invalidateLineStarts()
+    this._storage.setText(newText)
     this._patch.splice(ZERO, oldExtent, newExtent, oldText, newText)
     this._patch._removeNoopChange()
   }
@@ -448,15 +333,15 @@ class TextBuffer {
     const s = cmp(start, end) <= 0 ? start : end
     const e = cmp(start, end) <= 0 ? end : start
 
-    const oldText = this._getTextInRange(s, e)
+    const offset1 = this._storage.offsetForPosition(s)
+    const offset2 = this._storage.offsetForPosition(e)
+    const oldText = this._storage.slice(offset1, offset2)
     const oldExtent = traversal(e, s)
     const newExtent = textExtent(newText)
 
-    // Build new full text
-    const offset1 = this._offsetForPosition(s)
-    const offset2 = this._offsetForPosition(e)
-    this._text = this._text.slice(0, offset1) + newText + this._text.slice(offset2)
-    this._patchLineStarts(offset1, offset2, newText)
+    // O(log n + edit size) splice into the piece tree — the old string-based
+    // storage rebuilt the entire document here on every edit.
+    this._storage.splice(offset1, offset2, newText, oldText)
 
     // Update patch
     this._patch.splice(s, oldExtent, newExtent, oldText, newText)
@@ -471,9 +356,9 @@ class TextBuffer {
   }
 
   _getTextInRange (start, end) {
-    const offset1 = this._offsetForPosition(start)
-    const offset2 = this._offsetForPosition(end)
-    return this._text.slice(offset1, offset2)
+    const offset1 = this._storage.offsetForPosition(start)
+    const offset2 = this._storage.offsetForPosition(end)
+    return this._storage.slice(offset1, offset2)
   }
 
   // ---------------------------------------------------------------------------
@@ -481,18 +366,15 @@ class TextBuffer {
   // ---------------------------------------------------------------------------
 
   getLength () {
-    return this._text.length
+    return this._storage.length
   }
 
   getExtent () {
-    const text = this._text
-    const starts = this._getLineStarts()
-    const lastRow = starts.length - 1
-    return {row: lastRow, column: text.length - starts[lastRow]}
+    return this._storage.getExtent()
   }
 
   getLineCount () {
-    return this._getLineStarts().length
+    return this._storage.lineCount
   }
 
   // ---------------------------------------------------------------------------
@@ -501,73 +383,23 @@ class TextBuffer {
 
   // Returns {text, ending} for a given row, or undefined if row is out of bounds.
   _getLineInfo (row) {
-    if (row < 0) return
-    const text = this._text
-    const starts = this._getLineStarts()
-    if (row >= starts.length) return
-
-    const lineStart = starts[row]
-    const hasNextLine = row + 1 < starts.length
-    const nlOffset = hasNextLine ? starts[row + 1] - 1 : -1
-    const lineEnd = nlOffset === -1 ? text.length : nlOffset
-
-    let contentEnd = lineEnd
-    let ending = ''
-    if (nlOffset !== -1) {
-      if (contentEnd > lineStart && text.charCodeAt(contentEnd - 1) === 13) {
-        contentEnd--
-        ending = '\r\n'
-      } else {
-        ending = '\n'
-      }
-    }
-    return {text: text.slice(lineStart, contentEnd), ending}
+    return this._storage.lineInfoForRow(row)
   }
 
   lineForRow (row) {
-    const info = this._getLineInfo(row)
-    if (!info) return undefined
-    return info.text
+    return this._storage.lineForRow(row)
   }
 
   lineLengthForRow (row) {
-    if (row < 0) return undefined
-    const text = this._text
-    const starts = this._getLineStarts()
-    if (row >= starts.length) return undefined
-
-    const lineStart = starts[row]
-    const hasNextLine = row + 1 < starts.length
-    const nlOffset = hasNextLine ? starts[row + 1] - 1 : -1
-    let lineEnd = nlOffset === -1 ? text.length : nlOffset
-    if (nlOffset !== -1 && lineEnd > lineStart && text.charCodeAt(lineEnd - 1) === 13) {
-      lineEnd--
-    }
-    return lineEnd - lineStart
+    return this._storage.lineLengthForRow(row)
   }
 
   lineEndingForRow (row) {
-    const info = this._getLineInfo(row)
-    if (!info) return undefined
-    return info.ending
+    return this._storage.lineEndingForRow(row)
   }
 
   getLines () {
-    const text = this._text
-    const starts = this._getLineStarts()
-    const rowCount = starts.length
-    const lines = new Array(rowCount)
-    for (let row = 0; row < rowCount; row++) {
-      const lineStart = starts[row]
-      const hasNextLine = row + 1 < rowCount
-      const nlOffset = hasNextLine ? starts[row + 1] - 1 : -1
-      let lineEnd = nlOffset === -1 ? text.length : nlOffset
-      if (nlOffset !== -1 && lineEnd > lineStart && text.charCodeAt(lineEnd - 1) === 13) {
-        lineEnd--
-      }
-      lines[row] = text.slice(lineStart, lineEnd)
-    }
-    return lines
+    return this._storage.getLines()
   }
 
   // ---------------------------------------------------------------------------
@@ -575,7 +407,11 @@ class TextBuffer {
   // ---------------------------------------------------------------------------
 
   isModified () {
-    return this._text !== this._baseText
+    // Value comparison, not an edit-count shortcut: edits that restore the
+    // original content must report unmodified. The length pre-check keeps
+    // the common (modified) case from materializing the text.
+    return this._storage.length !== this._baseText.length ||
+      this._storage.getText() !== this._baseText
   }
 
   // ---------------------------------------------------------------------------
@@ -599,6 +435,15 @@ class TextBuffer {
       // column=Infinity means end of the row
       const lineInfo = this._getLineInfo(row)
       column = lineInfo ? lineInfo.text.length : 0
+    } else if (row < ext.row) {
+      // Clamp the column to the row's content length (like the C++
+      // implementation's clipping). Without this, a point past the end of a
+      // non-last row is "unreachable": offset conversion falls through to
+      // the end of the buffer, producing ranges whose text is empty but
+      // whose point-based extent is not — an inconsistency that corrupts
+      // the accumulated Patch.
+      const lineLen = this._storage.lineLengthForRow(row)
+      if (lineLen != null && column > lineLen) column = lineLen
     }
 
     return {row, column}
@@ -616,18 +461,19 @@ class TextBuffer {
   }
 
   positionForCharacterIndex (offset) {
+    const storage = this._storage
+    const length = storage.length
     if (offset < 0) offset = 0
-    if (offset > this._text.length) offset = this._text.length
-    const text = this._text
+    if (offset > length) offset = length
     // If the offset points at the '\n' of a CRLF pair, snap back to the end
     // of the visible content (before the '\r'). This matches the public-API
     // contract where column counts visible characters, not line terminators.
-    if (offset > 0 && offset < text.length &&
-        text.charCodeAt(offset) === 10 &&
-        text.charCodeAt(offset - 1) === 13) {
+    if (offset > 0 && offset < length &&
+        storage.charCodeAt(offset) === 10 &&
+        storage.charCodeAt(offset - 1) === 13) {
       offset--
     }
-    return this._positionForOffset(offset)
+    return storage.positionForOffset(offset)
   }
 
   // ---------------------------------------------------------------------------
@@ -639,26 +485,27 @@ class TextBuffer {
     if (row < 0) row = 0
     if (column < 0) column = 0
 
-    const text = this._text
-    const starts = this._getLineStarts()
+    const storage = this._storage
+    const lineCount = storage.lineCount
 
-    if (row >= starts.length) return ' '
+    if (row >= lineCount) return '\u0000'
 
-    const lineStart = starts[row]
-    const hasNextLine = row + 1 < starts.length
-    const lineEnd = hasNextLine ? starts[row + 1] - 1 : text.length
-
-    let lineContentEnd = lineEnd
-    if (lineContentEnd > lineStart && text.charCodeAt(lineContentEnd - 1) === 13) {
-      lineContentEnd--
+    const hasNextLine = row + 1 < lineCount
+    let contentLen = storage.lineLengthForRow(row)
+    // Unlike lineLengthForRow, this method also trims a trailing \r on the
+    // *last* line. Such a \r is by definition a lone one, so the extra read
+    // is skipped entirely in the common no-lone-\r case.
+    if (!hasNextLine && contentLen > 0 && storage.hasLoneCR()) {
+      const lineStart = storage.lineStartOffset(row)
+      if (storage.charCodeAt(lineStart + contentLen - 1) === 13) contentLen--
     }
 
-    if (column >= lineContentEnd - lineStart) {
+    if (column >= contentLen) {
       if (hasNextLine) return '\n'
-      return ' '
+      return '\u0000'
     }
 
-    return text[lineStart + column]
+    return storage.charAt(storage.lineStartOffset(row) + column)
   }
   // ---------------------------------------------------------------------------
   // Reset (sets base text and clears modified state)
@@ -667,8 +514,7 @@ class TextBuffer {
   reset (text) {
     if (typeof text !== 'string') text = String(text)
     this._baseText = text
-    this._text = text
-    this._invalidateLineStarts()
+    this._storage.setText(text)
     this._patch = new Patch()
     this._saveGeneration = 0
     this._baseGeneration = 0
@@ -679,12 +525,7 @@ class TextBuffer {
   // ---------------------------------------------------------------------------
 
   hasAstral () {
-    const text = this._text
-    for (let i = 0; i < text.length; i++) {
-      const code = text.charCodeAt(i)
-      if (code >= 0xD800 && code <= 0xDBFF) return true // high surrogate
-    }
-    return false
+    return this._storage.hasAstral()
   }
 
   // ---------------------------------------------------------------------------
@@ -692,16 +533,17 @@ class TextBuffer {
   // ---------------------------------------------------------------------------
 
   getSnapshot () {
-    return new TextBufferSnapshot(this._text, this._baseText)
+    return new TextBufferSnapshot(this._storage.getText(), this._baseText)
   }
 
   isModifiedSince (snapshot) {
-    return this._text !== snapshot._text
+    return this._storage.length !== snapshot._text.length ||
+      this._storage.getText() !== snapshot._text
   }
 
   getInvertedChanges (snapshot) {
     // Build a patch from current text to snapshot text
-    const oldText = this._text
+    const oldText = this._storage.getText()
     const newText = snapshot._text
     const p = new Patch()
     if (oldText !== newText) {
@@ -726,10 +568,9 @@ class TextBuffer {
       const s = change.oldStart
       const e = change.oldEnd
       const newText = change.newText || ''
-      const offset1 = this._offsetForPosition(s)
-      const offset2 = this._offsetForPosition(e)
-      this._text = this._text.slice(0, offset1) + newText + this._text.slice(offset2)
-      this._invalidateLineStarts()
+      const offset1 = this._storage.offsetForPosition(s)
+      const offset2 = this._storage.offsetForPosition(e)
+      this._storage.splice(offset1, offset2, newText, this._storage.slice(offset1, offset2))
     }
     this._patch = patch
   }
@@ -755,20 +596,20 @@ class TextBuffer {
 
   findSync (pattern, range) {
     if (range) return this.findInRangeSync(pattern, range)
-    return this._findInText(this._text, pattern, null)
+    return this._findInText(pattern, null)
   }
 
   findInRangeSync (pattern, range) {
-    return this._findInText(this._text, pattern, range)
+    return this._findInText(pattern, range)
   }
 
   findAllSync (pattern, range) {
     if (range) return this.findAllInRangeSync(pattern, range)
-    return this._findAllInText(this._text, pattern, null)
+    return this._findAllInText(pattern, null)
   }
 
   findAllInRangeSync (pattern, range) {
-    return this._findAllInText(this._text, pattern, range)
+    return this._findAllInText(pattern, range)
   }
 
   find (pattern, range) {
@@ -811,39 +652,35 @@ class TextBuffer {
   // endOffset (so $ anchors fire only at real line boundaries — matches
   // whose end exceeds endOffset are filtered out by the caller).
   _buildSearchSlice (charOffset, endOffset) {
-    const text = this._text
-    const starts = this._getLineStarts()
-    // Largest start index s.t. starts[idx] <= charOffset (binary search).
-    let lo = 0, hi = starts.length - 1
-    while (lo < hi) {
-      const mid = (lo + hi + 1) >>> 1
-      if (starts[mid] <= charOffset) lo = mid
-      else hi = mid - 1
-    }
-    const sliceBase = starts[lo]
-    // Find the first row whose start is > endOffset; slice ends just before
-    // its preceding \n (or at text end if endOffset is in the last line).
-    let endRow = lo
-    while (endRow + 1 < starts.length && starts[endRow + 1] <= endOffset) {
-      endRow++
-    }
-    const sliceLimit = endRow + 1 < starts.length ? starts[endRow + 1] - 1 : text.length
-    const sliceText = text.slice(sliceBase, sliceLimit)
+    const storage = this._storage
+    const startRow = storage.positionForOffset(charOffset).row
+    const sliceBase = storage.lineStartOffset(startRow)
+    // The row containing endOffset (an offset exactly at a line start counts
+    // as that line); the slice ends just before that row's \n (or at text
+    // end if endOffset is in the last line).
+    const endRow = storage.positionForOffset(endOffset).row
+    const sliceLimit = endRow + 1 < storage.lineCount
+      ? storage.lineStartOffset(endRow + 1) - 1
+      : storage.length
+    const sliceText = storage.slice(sliceBase, sliceLimit)
     return {
       sliceText,
       sliceBase,
       sliceLo: charOffset - sliceBase,
-      sliceHi: endOffset - sliceBase
+      sliceHi: endOffset - sliceBase,
+      startRow,
+      // When true, the character at sliceLimit in the buffer is a '\n' —
+      // needed by the CRLF helpers, which used to peek past the slice.
+      sliceFollowedByNewline: sliceLimit < storage.length
     }
   }
 
   // Internal: find first match (with optional range restriction).
-  _findInText (_text, pattern, range) {
+  _findInText (pattern, range) {
     const re = compilePattern(pattern)
-    const fullText = this._text
 
     let charOffset = 0
-    let endOffset = fullText.length
+    let endOffset = this._storage.length
     if (range) {
       const start = this._clipPoint(range.start)
       const end = this._clipPoint(range.end)
@@ -851,7 +688,8 @@ class TextBuffer {
       endOffset = this._offsetForPosition(end)
     }
 
-    const {sliceText, sliceBase, sliceLo, sliceHi} = this._buildSearchSlice(charOffset, endOffset)
+    const slice = this._buildSearchSlice(charOffset, endOffset)
+    const {sliceText, sliceBase, sliceLo, sliceHi} = slice
 
     re.lastIndex = sliceLo
     let match
@@ -866,8 +704,8 @@ class TextBuffer {
         const truncated = this._matchTruncatedToRange(pattern, sliceText, matchStart, sliceHi)
         if (truncated) {
           matchEnd = truncated.end
-          if (matchStart >= sliceLo && !this._isInsideCRLF(sliceBase + matchStart)) {
-            const trimmedEnd = this._trimCRLFEnd(sliceBase, matchStart, matchEnd, sliceText)
+          if (matchStart >= sliceLo && !this._isInsideCRLF(slice, matchStart)) {
+            const trimmedEnd = this._trimCRLFEnd(slice, matchStart, matchEnd)
             return {
               start: this._positionForOffset(sliceBase + matchStart),
               end: this._positionForOffset(sliceBase + trimmedEnd)
@@ -876,11 +714,11 @@ class TextBuffer {
         }
         return null
       }
-      const insideCRLF = this._isInsideCRLF(sliceBase + matchStart)
+      const insideCRLF = this._isInsideCRLF(slice, matchStart)
       // Treat \r\n as one logical line terminator: if the match consumed the
       // \r of a \r\n pair, exclude that \r from the result so points stay
       // at column 0 of the next line rather than mid-CRLF.
-      matchEnd = this._trimCRLFEnd(sliceBase, matchStart, matchEnd, sliceText)
+      matchEnd = this._trimCRLFEnd(slice, matchStart, matchEnd)
       if (!insideCRLF && matchStart >= sliceLo) {
         return {
           start: this._positionForOffset(sliceBase + matchStart),
@@ -906,26 +744,28 @@ class TextBuffer {
 
   // If a regex match ended at a \r that's immediately followed by \n, trim
   // the \r off the end so the resulting Range never points "inside" a CRLF
-  // line ending. Operates in slice-local coordinates.
-  _trimCRLFEnd (sliceBase, matchStart, matchEnd, sliceText) {
+  // line ending. Operates in slice-local coordinates. The character right
+  // after the slice is a '\n' exactly when sliceFollowedByNewline is set
+  // (the slice always ends just before a line break or at the buffer end),
+  // so no reads outside the slice are needed.
+  _trimCRLFEnd (slice, matchStart, matchEnd) {
     if (matchEnd <= matchStart) return matchEnd
+    const {sliceText, sliceFollowedByNewline} = slice
     if (sliceText.charCodeAt(matchEnd - 1) !== 13) return matchEnd
-    // Look at the character following the match in the full buffer text.
-    const fullEnd = sliceBase + matchEnd
-    if (fullEnd < this._text.length && this._text.charCodeAt(fullEnd) === 10) {
-      return matchEnd - 1
-    }
+    const followedByLF = matchEnd < sliceText.length
+      ? sliceText.charCodeAt(matchEnd) === 10
+      : sliceFollowedByNewline
+    if (followedByLF) return matchEnd - 1
     return matchEnd
   }
 
   // Internal: find all matches (with optional range restriction).
-  _findAllInText (_text, pattern, range) {
+  _findAllInText (pattern, range) {
     const re = compilePattern(pattern)
     const results = []
-    const fullText = this._text
 
     let charOffset = 0
-    let endOffset = fullText.length
+    let endOffset = this._storage.length
     if (range) {
       const start = this._clipPoint(range.start)
       const end = this._clipPoint(range.end)
@@ -933,16 +773,26 @@ class TextBuffer {
       endOffset = this._offsetForPosition(end)
     }
 
-    const {sliceText, sliceBase, sliceLo, sliceHi} = this._buildSearchSlice(charOffset, endOffset)
+    const slice = this._buildSearchSlice(charOffset, endOffset)
+    const {sliceText, sliceBase, sliceLo, sliceHi, startRow} = slice
 
-    // Cached line-starts for O(1) per-match position lookup via monotonic cursor.
-    const starts = this._getLineStarts()
+    // Slice-local line starts for O(1) per-match position lookup via a
+    // monotonic cursor. The slice begins at the start of startRow and every
+    // \n inside it is a real line boundary, so slice-local row N is buffer
+    // row startRow + N.
+    const localStarts = [0]
+    let nl = sliceText.indexOf('\n')
+    while (nl !== -1) {
+      localStarts.push(nl + 1)
+      nl = sliceText.indexOf('\n', nl + 1)
+    }
     let cursorRow = 0
     const offsetToPos = (offset) => {
-      while (cursorRow + 1 < starts.length && starts[cursorRow + 1] <= offset) {
+      const local = offset - sliceBase
+      while (cursorRow + 1 < localStarts.length && localStarts[cursorRow + 1] <= local) {
         cursorRow++
       }
-      return {row: cursorRow, column: offset - starts[cursorRow]}
+      return {row: startRow + cursorRow, column: local - localStarts[cursorRow]}
     }
 
     re.lastIndex = sliceLo
@@ -965,9 +815,9 @@ class TextBuffer {
       // Skip matches that landed "inside" a CRLF pair — JS treats \r as a
       // line terminator, but the C++ implementation (and these tests) treat
       // \r\n as a single line ending and never split it.
-      const insideCRLF = this._isInsideCRLF(sliceBase + matchStart)
+      const insideCRLF = this._isInsideCRLF(slice, matchStart)
       // Trim a trailing \r that's actually part of a \r\n line ending.
-      matchEnd = this._trimCRLFEnd(sliceBase, matchStart, matchEnd, sliceText)
+      matchEnd = this._trimCRLFEnd(slice, matchStart, matchEnd)
       const trimmedMatchEnd = matchEnd
 
       if (!insideCRLF && matchStart >= sliceLo) {
@@ -999,11 +849,16 @@ class TextBuffer {
     return results
   }
 
-  // True when the absolute offset `o` sits between the \r and \n of a CRLF.
-  _isInsideCRLF (o) {
-    const text = this._text
-    return o > 0 && o < text.length &&
-      text.charCodeAt(o - 1) === 13 && text.charCodeAt(o) === 10
+  // True when the slice-local offset `local` sits between the \r and \n of
+  // a CRLF. The slice starts at a line start (the previous character is a
+  // \n or the buffer start) and ends just before a \n when
+  // sliceFollowedByNewline is set, so the check never reads the buffer.
+  _isInsideCRLF (slice, local) {
+    if (local <= 0) return false
+    const {sliceText, sliceFollowedByNewline} = slice
+    if (sliceText.charCodeAt(local - 1) !== 13) return false
+    if (local < sliceText.length) return sliceText.charCodeAt(local) === 10
+    return sliceFollowedByNewline
   }
 
   // ---------------------------------------------------------------------------
@@ -1047,7 +902,7 @@ class TextBuffer {
     const end = this._clipPoint(range.end)
     const charStart = this._offsetForPosition(start)
     const charEnd = this._offsetForPosition(end)
-    const text = this._text.slice(charStart, charEnd)
+    const text = this._storage.slice(charStart, charEnd)
 
     // Tokenize: split by word boundaries
     // Word chars: \w + extraWordCharacters
@@ -1216,7 +1071,7 @@ class TextBuffer {
 
       let resultPatch = null
       if (computePatch) {
-        resultPatch = computeTextDiff(this._text, newText)
+        resultPatch = computeTextDiff(this._storage.getText(), newText)
       }
 
       // Final progress tick — pass the patch so the callback can inspect it
@@ -1226,9 +1081,8 @@ class TextBuffer {
         if (r === false) return null
       }
 
-      this._text = newText
+      this._storage.setText(newText)
       this._baseText = newText
-      this._invalidateLineStarts()
       this._patch = new Patch()
 
       return resultPatch
@@ -1246,7 +1100,7 @@ class TextBuffer {
 
   save (destination, encoding) {
     const fs = require('fs')
-    const snapshot = this._text
+    const snapshot = this._storage.getText()
     const generation = ++this._saveGeneration
     encoding = encoding || 'UTF-8'
 
@@ -1296,7 +1150,8 @@ class TextBuffer {
         if (generation > this._baseGeneration) {
           this._baseText = snapshot
           this._baseGeneration = generation
-          if (this._text === snapshot) {
+          if (this._storage.length === snapshot.length &&
+              this._storage.getText() === snapshot) {
             this._patch = new Patch()
           }
         }
