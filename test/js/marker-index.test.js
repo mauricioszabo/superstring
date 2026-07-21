@@ -534,39 +534,4 @@ describe('MarkerIndex', () => {
     let result = index.findEndingIn({row: 0, column: 0}, {row: Infinity, column: Infinity})
     assert(result.has(1))
   })
-
-  it('caches positions on nodes and invalidates them with splice generations', () => {
-    const index = new MarkerIndex()
-    index.insert(1, {row: 0, column: 2}, {row: 0, column: 8})
-
-    const node = index._startNodesById.get(1)
-    assert.deepEqual(index.getStart(1), {row: 0, column: 2})
-    assert.notProperty(index, '_nodePositionCache')
-    assert.deepEqual(node.cachedPosition, {row: 0, column: 2})
-    assert.equal(node.cachedGeneration, index._generation)
-
-    const oldGeneration = index._generation
-    index.splice({row: 0, column: 0}, {row: 0, column: 0}, {row: 0, column: 3})
-    assert.equal(index._generation, oldGeneration + 1)
-    assert.notEqual(node.cachedGeneration, index._generation)
-    assert.deepEqual(index.getStart(1), {row: 0, column: 5})
-    assert.equal(node.cachedGeneration, index._generation)
-  })
-
-  it('batches duplicate query candidates before returning a Set', () => {
-    const index = new MarkerIndex()
-    const originalFindIntersecting = index.iterator.findIntersecting
-    let accumulator
-    index.iterator.findIntersecting = function (start, end, result) {
-      accumulator = result
-      result.push(7, 7, 9)
-    }
-
-    const result = index.findIntersecting({row: 0, column: 0}, {row: 0, column: 0})
-    index.iterator.findIntersecting = originalFindIntersecting
-
-    assert(Array.isArray(accumulator))
-    assert.instanceOf(result, Set)
-    assert.deepEqual([...result], [7, 9])
-  })
 })

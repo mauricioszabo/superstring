@@ -278,14 +278,14 @@ class Iterator {
 
   checkIntersection (start, end, result) {
     if (cmp(this.leftAncestorPosition, end) <= 0 && cmp(start, this.nodePosition) <= 0) {
-      for (const id of this.node.leftMarkerIds) result.push(id)
+      for (const id of this.node.leftMarkerIds) result.add(id)
     }
     if (cmp(start, this.nodePosition) <= 0 && cmp(this.nodePosition, end) <= 0) {
-      for (const id of this.node.startMarkerIds) result.push(id)
-      for (const id of this.node.endMarkerIds) result.push(id)
+      for (const id of this.node.startMarkerIds) result.add(id)
+      for (const id of this.node.endMarkerIds) result.add(id)
     }
     if (cmp(this.nodePosition, end) <= 0 && cmp(start, this.rightAncestorPosition) <= 0) {
-      for (const id of this.node.rightMarkerIds) result.push(id)
+      for (const id of this.node.rightMarkerIds) result.add(id)
     }
   }
 
@@ -859,20 +859,18 @@ class MarkerIndex {
   }
 
   findIntersecting (start, end) {
-    const result = []
+    const result = new Set()
     this.iterator.findIntersecting(start, end, result)
-    return new Set(result)
+    return result
   }
 
   findContaining (start, end) {
-    const containingStartIds = []
-    this.iterator.findIntersecting(start, start, containingStartIds)
-    const containingStart = new Set(containingStartIds)
+    const containingStart = new Set()
+    this.iterator.findIntersecting(start, start, containingStart)
     if (cmp(end, start) === 0) return containingStart
 
-    const containingEndIds = []
-    this.iterator.findIntersecting(end, end, containingEndIds)
-    const containingEnd = new Set(containingEndIds)
+    const containingEnd = new Set()
+    this.iterator.findIntersecting(end, end, containingEnd)
 
     const result = new Set()
     for (const id of containingStart) {
