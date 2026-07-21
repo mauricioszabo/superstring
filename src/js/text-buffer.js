@@ -314,6 +314,66 @@ class TextBuffer {
     this._lineStarts = null
   }
 
+  // Incrementally update the cached line-starts array after replacing
+  // this._text[offset1, offset2) with newText, instead of discarding the
+  // whole array and rescanning the entire (potentially huge) document on
+  // the next access. Only the newlines inside newText need to be found;
+  // every line start before offset1 is untouched, and every one after
+  // offset2 just shifts by the length delta.
+  //
+  // No-op (falls back to a full invalidation) if the cache isn't already
+  // built — there's nothing to patch incrementally in that case.
+  _patchLineStarts (offset1, offset2, newText) {
+    const starts = this._lineStarts
+    if (!starts) return
+
+    // Index of the first line-start after offset1 (i.e. first row whose
+    // start is strictly greater than offset1). Rows [0, cutStart) are kept
+    // as-is.
+    let cutStart = starts.length
+    {
+      let lo = 0
+      let hi = starts.length
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1
+        if (starts[mid] <= offset1) lo = mid + 1
+        else hi = mid
+      }
+      cutStart = lo
+    }
+
+    // Index of the first line-start strictly after offset2. Rows
+    // [cutEnd, end) survive the splice, just shifted by delta. A line-start
+    // exactly at offset2 is dropped here too — it marked the boundary of the
+    // deleted region, and the tail now begins right after the inserted text.
+    let cutEnd = starts.length
+    {
+      let lo = cutStart
+      let hi = starts.length
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1
+        if (starts[mid] <= offset2) lo = mid + 1
+        else hi = mid
+      }
+      cutEnd = lo
+    }
+
+    const delta = newText.length - (offset2 - offset1)
+    const inserted = []
+    for (let i = 0; i < newText.length; i++) {
+      if (newText.charCodeAt(i) === 10) inserted.push(offset1 + i + 1)
+    }
+
+    const tail = starts.length - cutEnd
+    const newLength = cutStart + inserted.length + tail
+    const result = new Array(newLength)
+    for (let i = 0; i < cutStart; i++) result[i] = starts[i]
+    for (let i = 0; i < inserted.length; i++) result[cutStart + i] = inserted[i]
+    for (let i = 0; i < tail; i++) result[cutStart + inserted.length + i] = starts[cutEnd + i] + delta
+
+    this._lineStarts = result
+  }
+
   // O(log lines) position lookup against this._text using the cached line-start index.
   // Equivalent to textPositionForOffset(this._text, offset) but without scanning.
   _positionForOffset (offset) {
@@ -396,7 +456,7 @@ class TextBuffer {
     const offset1 = this._offsetForPosition(s)
     const offset2 = this._offsetForPosition(e)
     this._text = this._text.slice(0, offset1) + newText + this._text.slice(offset2)
-    this._invalidateLineStarts()
+    this._patchLineStarts(offset1, offset2, newText)
 
     // Update patch
     this._patch.splice(s, oldExtent, newExtent, oldText, newText)
