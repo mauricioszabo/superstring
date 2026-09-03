@@ -912,6 +912,22 @@ describe('TextBuffer', () => {
       buffer2.deserializeChanges(changes)
       assert.equal(buffer2.getText(), '\n123D')
     })
+
+    it('restores changes from a Buffer view with a non-zero byte offset', () => {
+      const buffer = new TextBuffer('abc')
+      buffer.setTextInRange(Range(Point(0, 0), Point(0, 0)), '\n')
+
+      const changes = buffer.serializeChanges()
+      const storage = Buffer.alloc(changes.length + 8)
+      changes.copy(storage, 4)
+      const changesView = storage.subarray(4, 4 + changes.length)
+
+      assert.notEqual(changesView.byteOffset, 0)
+
+      const buffer2 = new TextBuffer('123')
+      buffer2.deserializeChanges(changesView)
+      assert.equal(buffer2.getText(), '\n123')
+    })
   })
 
   describe('.find (sync and async)', () => {

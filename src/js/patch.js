@@ -1436,7 +1436,14 @@ class Patch {
   }
 
   static deserialize (buffer) {
-    const arr = new Uint32Array(buffer.buffer || buffer)
+    const arrayBuffer = buffer.buffer || buffer
+    const byteOffset = buffer.byteOffset || 0
+    const byteLength = buffer.byteLength || arrayBuffer.byteLength
+    const arr = new Uint32Array(
+      arrayBuffer,
+      byteOffset,
+      byteLength / Uint32Array.BYTES_PER_ELEMENT
+    )
     let idx = 0
 
     const version = arr[idx++]
