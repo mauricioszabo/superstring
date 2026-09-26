@@ -67,7 +67,7 @@
                 "src/core/tree-sitter/wasm-engine.cc",
                 "src/core/tree-sitter/grammar.cc",
                 "src/core/tree-sitter/query.cc",
-                "src/core/tree-sitter/language-mode.cc",
+                "src/core/tree-sitter/parser.cc",
             ],
             "include_dirs": [
                 "src/core",

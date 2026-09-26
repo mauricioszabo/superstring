@@ -2,6 +2,7 @@
 #include "tree-sitter-wrapper.h"
 #include "addon-data.h"
 #include "text-buffer-wrapper.h"
+#include "tree-sitter/parser.h"
 #include "string-conversion.h"
 
 using namespace Napi;
@@ -9,7 +10,7 @@ using std::shared_ptr;
 using std::string;
 using std::vector;
 using tree_sitter::Grammar;
-using tree_sitter::LanguageMode;
+using tree_sitter::Parser;
 using tree_sitter::Query;
 using tree_sitter::QueryCapture;
 using tree_sitter::TreeHolder;
@@ -224,102 +225,163 @@ Napi::Value TreeSitterQueryWrapper::captures(const CallbackInfo &info) {
   return result;
 }
 
-// TreeSitterLanguageMode
+namespace {
 
-void TreeSitterLanguageModeWrapper::init(Napi::Env env, Object exports) {
-  Function func = DefineClass(env, "TreeSitterLanguageMode", {
-    InstanceMethod<&TreeSitterLanguageModeWrapper::create_layer>("createLayer", napi_default_method),
-    InstanceMethod<&TreeSitterLanguageModeWrapper::destroy_layer>("destroyLayer", napi_default_method),
-    InstanceMethod<&TreeSitterLanguageModeWrapper::set_included_ranges>("setIncludedRanges", napi_default_method),
-    InstanceMethod<&TreeSitterLanguageModeWrapper::edit>("edit", napi_default_method),
-    InstanceMethod<&TreeSitterLanguageModeWrapper::parse>("parse", napi_default_method),
-    InstanceMethod<&TreeSitterLanguageModeWrapper::root_node>("rootNode", napi_default_method),
-  });
-  exports.Set("TreeSitterLanguageMode", func);
+// A web-tree-sitter range ({startIndex, endIndex, startPosition,
+// endPosition}, in code units) as a Tree-sitter range.
+TSRange range_from_js(const Napi::Value &value) {
+  Object object = value.As<Object>();
+  return {
+    point_from_js(object.Get("startPosition")),
+    point_from_js(object.Get("endPosition")),
+    code_unit_to_byte(i32_from_js(object.Get("startIndex"))),
+    code_unit_to_byte(i32_from_js(object.Get("endIndex")))
+  };
 }
 
-// new TreeSitterLanguageMode(nativeTextBuffer)
-TreeSitterLanguageModeWrapper::TreeSitterLanguageModeWrapper(const CallbackInfo &info) :
-  ObjectWrap<TreeSitterLanguageModeWrapper>(info) {
-  Napi::Env env = info.Env();
-  TextBufferWrapper *text_buffer = info[0].IsObject() ? TextBufferWrapper::Unwrap(info[0].As<Object>()) : nullptr;
-  if (!text_buffer) {
-    Error::New(env, "Expected a native TextBuffer").ThrowAsJavaScriptException();
-    return;
-  }
-  buffer = std::make_shared<TextBufferHandle>();
-  buffer->reference = Persistent(info[0].As<Object>());
-  buffer->buffer = &text_buffer->text_buffer;
-  language_mode.reset(new LanguageMode(buffer->buffer));
-}
-
-// createLayer(grammar) -> layer id
-Napi::Value TreeSitterLanguageModeWrapper::create_layer(const CallbackInfo &info) {
-  Napi::Env env = info.Env();
-  auto grammar = TreeSitterGrammarWrapper::from_js(info[0]);
-  if (!grammar) {
-    Error::New(env, "Expected a TreeSitterGrammar").ThrowAsJavaScriptException();
-    return env.Undefined();
-  }
-  return Number::New(env, language_mode->create_layer(grammar));
-}
-
-void TreeSitterLanguageModeWrapper::destroy_layer(const CallbackInfo &info) {
-  language_mode->destroy_layer(i32_from_js(info[0]));
-}
-
-// setIncludedRanges(layerId, ranges): `ranges` holds
-// (startIndex, endIndex, startRow, startColumn, endRow, endColumn) sextuples
-// in code units; an empty list means the whole buffer.
-void TreeSitterLanguageModeWrapper::set_included_ranges(const CallbackInfo &info) {
-  vector<TSRange> ranges;
-  if (info[1].IsTypedArray()) {
-    auto values = info[1].As<Uint32Array>();
-    for (size_t i = 0; i + 5 < values.ElementLength(); i += 6) {
-      ranges.push_back({
-        {values[i + 2], code_unit_to_byte(values[i + 3])},
-        {values[i + 4], code_unit_to_byte(values[i + 5])},
-        code_unit_to_byte(values[i]),
-        code_unit_to_byte(values[i + 1])
-      });
-    }
-  }
-  language_mode->set_included_ranges(i32_from_js(info[0]), std::move(ranges));
-}
-
-// edit(startIndex, oldEndIndex, newEndIndex, startRow, startColumn,
-//      oldEndRow, oldEndColumn, newEndRow, newEndColumn), in code units.
-void TreeSitterLanguageModeWrapper::edit(const CallbackInfo &info) {
-  language_mode->edit(
-    i32_from_js(info[0]), i32_from_js(info[1]), i32_from_js(info[2]),
-    Point(i32_from_js(info[3]), i32_from_js(info[4])),
-    Point(i32_from_js(info[5]), i32_from_js(info[6])),
-    Point(i32_from_js(info[7]), i32_from_js(info[8]))
-  );
-}
-
-// parse(layerId) -> Uint32Array of changed (startRow, startColumn, endRow,
-// endColumn) ranges, or null if parsing failed.
-Napi::Value TreeSitterLanguageModeWrapper::parse(const CallbackInfo &info) {
-  Napi::Env env = info.Env();
-  vector<Range> changed_ranges;
-  if (!language_mode->parse(i32_from_js(info[0]), &changed_ranges)) return env.Null();
-  auto result = Uint32Array::New(env, changed_ranges.size() * 4);
-  for (size_t i = 0; i < changed_ranges.size(); i++) {
-    result[i * 4] = changed_ranges[i].start.row;
-    result[i * 4 + 1] = changed_ranges[i].start.column;
-    result[i * 4 + 2] = changed_ranges[i].end.row;
-    result[i * 4 + 3] = changed_ranges[i].end.column;
-  }
+Object range_to_js(Napi::Env env, const TSRange &range) {
+  Object result = Object::New(env);
+  result.Set("startIndex", Number::New(env, byte_to_code_unit(range.start_byte)));
+  result.Set("endIndex", Number::New(env, byte_to_code_unit(range.end_byte)));
+  result.Set("startPosition", point_to_js(env, range.start_point));
+  result.Set("endPosition", point_to_js(env, range.end_point));
   return result;
 }
 
-// rootNode(layerId) -> SyntaxNode | null
-Napi::Value TreeSitterLanguageModeWrapper::root_node(const CallbackInfo &info) {
+}  // namespace
+
+// TreeSitterParser
+
+void TreeSitterParserWrapper::init(Napi::Env env, Object exports) {
+  Function func = DefineClass(env, "TreeSitterParser", {
+    InstanceMethod<&TreeSitterParserWrapper::parse>("parse", napi_default_method),
+  });
+  exports.Set("TreeSitterParser", func);
+}
+
+// new TreeSitterParser(grammar)
+TreeSitterParserWrapper::TreeSitterParserWrapper(const CallbackInfo &info) : ObjectWrap<TreeSitterParserWrapper>(info) {
+  auto grammar = TreeSitterGrammarWrapper::from_js(info[0]);
+  if (!grammar) {
+    Error::New(info.Env(), "Expected a TreeSitterGrammar").ThrowAsJavaScriptException();
+    return;
+  }
+  parser.reset(new Parser(grammar));
+}
+
+// parse(nativeTextBuffer, oldTree, includedRanges) -> TreeSitterTree | null.
+// `oldTree` (or null) must have been edited to match the buffer;
+// `includedRanges` is an array of web-tree-sitter ranges, or null.
+Napi::Value TreeSitterParserWrapper::parse(const CallbackInfo &info) {
   Napi::Env env = info.Env();
-  auto tree = language_mode->tree(i32_from_js(info[0]));
+  TextBufferWrapper *text_buffer = info[0].IsObject() ? TextBufferWrapper::Unwrap(info[0].As<Object>()) : nullptr;
+  if (!text_buffer || !parser) {
+    Error::New(env, "Expected a native TextBuffer").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  TreeSitterTreeWrapper *old_tree = TreeSitterTreeWrapper::from_js(info[1]);
+
+  vector<TSRange> included_ranges;
+  if (info[2].IsArray()) {
+    Array ranges = info[2].As<Array>();
+    for (uint32_t i = 0; i < ranges.Length(); i++) {
+      Napi::Value range = ranges[i];
+      if (range.IsObject()) included_ranges.push_back(range_from_js(range));
+    }
+  }
+
+  TSTree *tree = parser->parse(
+    &text_buffer->text_buffer,
+    old_tree && old_tree->tree ? old_tree->tree->tree : nullptr,
+    included_ranges
+  );
   if (!tree) return env.Null();
-  return SyntaxNodeWrapper::from_node(env, ts_tree_root_node(tree->tree), tree, buffer);
+
+  auto buffer = std::make_shared<TextBufferHandle>();
+  buffer->reference = Persistent(info[0].As<Object>());
+  buffer->buffer = &text_buffer->text_buffer;
+  return TreeSitterTreeWrapper::from_tree(env, std::make_shared<TreeHolder>(tree), buffer);
+}
+
+// TreeSitterTree
+
+void TreeSitterTreeWrapper::init(Napi::Env env, Object exports) {
+  auto *data = env.GetInstanceData<AddonData>();
+  Function func = DefineClass(env, "TreeSitterTree", {
+    InstanceAccessor<&TreeSitterTreeWrapper::get_root_node>("rootNode"),
+    InstanceMethod<&TreeSitterTreeWrapper::edit>("edit", napi_default_method),
+    InstanceMethod<&TreeSitterTreeWrapper::get_changed_ranges>("getChangedRanges", napi_default_method),
+    InstanceMethod<&TreeSitterTreeWrapper::copy>("copy", napi_default_method),
+    InstanceMethod<&TreeSitterTreeWrapper::delete_tree>("delete", napi_default_method),
+  });
+  data->tree_sitter_tree_constructor = Persistent(func);
+  exports.Set("TreeSitterTree", func);
+}
+
+TreeSitterTreeWrapper::TreeSitterTreeWrapper(const CallbackInfo &info) : ObjectWrap<TreeSitterTreeWrapper>(info) {}
+
+Napi::Value TreeSitterTreeWrapper::from_tree(Napi::Env env, shared_ptr<TreeHolder> tree,
+                                             shared_ptr<TextBufferHandle> buffer) {
+  auto *data = env.GetInstanceData<AddonData>();
+  Object object = data->tree_sitter_tree_constructor.New({});
+  TreeSitterTreeWrapper *wrapper = Unwrap(object);
+  wrapper->tree = std::move(tree);
+  wrapper->buffer = std::move(buffer);
+  return object;
+}
+
+TreeSitterTreeWrapper *TreeSitterTreeWrapper::from_js(Napi::Value value) {
+  if (!value.IsObject()) return nullptr;
+  auto *data = value.Env().GetInstanceData<AddonData>();
+  Object object = value.As<Object>();
+  if (!object.InstanceOf(data->tree_sitter_tree_constructor.Value())) return nullptr;
+  return Unwrap(object);
+}
+
+Napi::Value TreeSitterTreeWrapper::get_root_node(const CallbackInfo &info) {
+  if (!tree) return info.Env().Null();
+  return SyntaxNodeWrapper::from_node(info.Env(), ts_tree_root_node(tree->tree), tree, buffer);
+}
+
+// edit({startIndex, oldEndIndex, newEndIndex, startPosition, oldEndPosition,
+// newEndPosition}), in code units, like web-tree-sitter's Tree#edit.
+void TreeSitterTreeWrapper::edit(const CallbackInfo &info) {
+  if (!tree || !info[0].IsObject()) return;
+  Object object = info[0].As<Object>();
+  TSInputEdit edit = {
+    code_unit_to_byte(i32_from_js(object.Get("startIndex"))),
+    code_unit_to_byte(i32_from_js(object.Get("oldEndIndex"))),
+    code_unit_to_byte(i32_from_js(object.Get("newEndIndex"))),
+    point_from_js(object.Get("startPosition")),
+    point_from_js(object.Get("oldEndPosition")),
+    point_from_js(object.Get("newEndPosition"))
+  };
+  ts_tree_edit(tree->tree, &edit);
+}
+
+// getChangedRanges(newTree) -> [web-tree-sitter ranges]
+Napi::Value TreeSitterTreeWrapper::get_changed_ranges(const CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  TreeSitterTreeWrapper *other = from_js(info[0]);
+  if (!tree || !other || !other->tree) {
+    Error::New(env, "Argument must be a Tree").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  uint32_t count = 0;
+  TSRange *ranges = ts_tree_get_changed_ranges(tree->tree, other->tree->tree, &count);
+  Array result = Array::New(env, count);
+  for (uint32_t i = 0; i < count; i++) result[i] = range_to_js(env, ranges[i]);
+  free(ranges);
+  return result;
+}
+
+Napi::Value TreeSitterTreeWrapper::copy(const CallbackInfo &info) {
+  if (!tree) return info.Env().Null();
+  return from_tree(info.Env(), std::make_shared<TreeHolder>(ts_tree_copy(tree->tree)), buffer);
+}
+
+void TreeSitterTreeWrapper::delete_tree(const CallbackInfo &info) {
+  tree.reset();
 }
 
 // SyntaxNode
@@ -342,6 +404,7 @@ void SyntaxNodeWrapper::init(Napi::Env env, Object exports) {
     InstanceAccessor<&SyntaxNodeWrapper::get_has_error>("hasError"),
     InstanceAccessor<&SyntaxNodeWrapper::get_has_changes>("hasChanges"),
     InstanceAccessor<&SyntaxNodeWrapper::get_parent>("parent"),
+    InstanceAccessor<&SyntaxNodeWrapper::get_tree>("tree"),
     InstanceAccessor<&SyntaxNodeWrapper::get_child_count>("childCount"),
     InstanceAccessor<&SyntaxNodeWrapper::get_named_child_count>("namedChildCount"),
     InstanceAccessor<&SyntaxNodeWrapper::get_children>("children"),
@@ -456,6 +519,10 @@ Napi::Value SyntaxNodeWrapper::get_has_changes(const CallbackInfo &info) {
 
 Napi::Value SyntaxNodeWrapper::get_parent(const CallbackInfo &info) {
   return wrap(info.Env(), ts_node_parent(node));
+}
+
+Napi::Value SyntaxNodeWrapper::get_tree(const CallbackInfo &info) {
+  return TreeSitterTreeWrapper::from_tree(info.Env(), tree, buffer);
 }
 
 Napi::Value SyntaxNodeWrapper::get_child_count(const CallbackInfo &info) {

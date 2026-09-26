@@ -1,7 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const {assert} = require('chai')
-const {TextBuffer, TreeSitterGrammar, TreeSitterLanguageMode} = require('../..')
+const {TextBuffer, TreeSitterGrammar, TreeSitterParser} = require('../..')
 
 // These cover the bindings; Pulsar's specs compare the native language mode
 // with the web-tree-sitter one.
@@ -10,10 +10,9 @@ describe('native Tree-sitter', () => {
 
   function parse (text) {
     const buffer = new TextBuffer(text)
-    const languageMode = new TreeSitterLanguageMode(buffer)
-    const layer = languageMode.createLayer(grammar)
-    const changedRanges = languageMode.parse(layer)
-    return {buffer, languageMode, layer, changedRanges, root: languageMode.rootNode(layer)}
+    const parser = new TreeSitterParser(grammar)
+    const tree = parser.parse(buffer, null, null)
+    return {buffer, parser, tree, root: tree.rootNode}
   }
 
   it('loads WASM grammars', () => {
@@ -22,9 +21,10 @@ describe('native Tree-sitter', () => {
   })
 
   it('parses straight from a native TextBuffer, with web-tree-sitter-like nodes', () => {
-    const {root, changedRanges} = parse('{"a": [1, "é"],\n "b": true}')
+    const {root} = parse('{"a": [1, "é"],\n "b": true}')
     assert.equal(root.type, 'document')
-    assert.deepEqual(Array.from(changedRanges), [0, 0, 1, 11])
+    assert.deepEqual(root.endPosition, {row: 1, column: 11})
+    assert.equal(root.tree.rootNode.type, 'document')
     const object = root.firstChild
     assert.equal(object.type, 'object')
     assert.equal(object.childCount, 5)
@@ -72,12 +72,22 @@ describe('native Tree-sitter', () => {
   })
 
   it('reparses incrementally after edits, reporting changed ranges', () => {
-    const {buffer, languageMode, layer} = parse('[1, 2, 3]')
+    const {buffer, parser, tree} = parse('[1, 2, 3]')
+    const copy = tree.copy()
     buffer.setTextInRange({start: {row: 0, column: 4}, end: {row: 0, column: 5}}, '"two"')
-    languageMode.edit(4, 5, 9, 0, 4, 0, 5, 0, 9)
-    const changedRanges = languageMode.parse(layer)
-    assert.isAbove(changedRanges.length, 0)
-    assert.deepEqual(languageMode.rootNode(layer).firstChild.namedChildren.map((n) => n.type), ['number', 'string', 'number'])
+    tree.edit({
+      startIndex: 4, oldEndIndex: 5, newEndIndex: 9,
+      startPosition: {row: 0, column: 4}, oldEndPosition: {row: 0, column: 5}, newEndPosition: {row: 0, column: 9}
+    })
+    const newTree = parser.parse(buffer, tree, null)
+    assert.deepEqual(newTree.rootNode.firstChild.namedChildren.map((n) => n.type), ['number', 'string', 'number'])
+    const changedRanges = tree.getChangedRanges(newTree)
+    assert.deepEqual(changedRanges, [{startIndex: 4, endIndex: 9, startPosition: {row: 0, column: 4}, endPosition: {row: 0, column: 9}}])
+    // The copy wasn't edited.
+    assert.deepEqual(copy.rootNode.firstChild.namedChildren.map((n) => n.type), ['number', 'number', 'number'])
+    tree.delete()
+    tree.delete()
+    assert.isNull(tree.rootNode)
   })
 
   it('reads text with CRLF line endings by offset', () => {
@@ -89,11 +99,9 @@ describe('native Tree-sitter', () => {
 
   it('parses only the included ranges', () => {
     const buffer = new TextBuffer('xx [1] yy [2] zz')
-    const languageMode = new TreeSitterLanguageMode(buffer)
-    const layer = languageMode.createLayer(grammar)
-    languageMode.setIncludedRanges(layer, new Uint32Array([3, 6, 0, 3, 0, 6]))
-    languageMode.parse(layer)
-    const root = languageMode.rootNode(layer)
+    const parser = new TreeSitterParser(grammar)
+    const tree = parser.parse(buffer, null, [{startIndex: 3, endIndex: 6, startPosition: {row: 0, column: 3}, endPosition: {row: 0, column: 6}}])
+    const root = tree.rootNode
     assert.isFalse(root.hasError)
     assert.deepEqual(root.descendantsOfType('number').map((n) => n.text), ['1'])
   })

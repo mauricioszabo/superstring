@@ -357,6 +357,7 @@ module.exports = {
   DisplayLayer: binding.DisplayLayer,
   TreeSitterGrammar: binding.TreeSitterGrammar,
   TreeSitterQuery: binding.TreeSitterQuery,
-  TreeSitterLanguageMode: binding.TreeSitterLanguageMode,
+  TreeSitterParser: binding.TreeSitterParser,
+  TreeSitterTree: binding.TreeSitterTree,
   SyntaxNode: binding.SyntaxNode,
 }

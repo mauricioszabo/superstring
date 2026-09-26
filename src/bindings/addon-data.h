@@ -25,6 +25,7 @@ public:
   // Tree-sitter
   Napi::FunctionReference tree_sitter_query_constructor;
   Napi::FunctionReference syntax_node_constructor;
+  Napi::FunctionReference tree_sitter_tree_constructor;
 
   // TextReader
   Napi::FunctionReference text_reader_constructor;

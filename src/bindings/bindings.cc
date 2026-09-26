@@ -24,7 +24,8 @@ Object Init(Env env, Object exports) {
   DisplayLayerWrapper::init(env, exports);
   TreeSitterGrammarWrapper::init(env, exports);
   TreeSitterQueryWrapper::init(env, exports);
-  TreeSitterLanguageModeWrapper::init(env, exports);
+  TreeSitterParserWrapper::init(env, exports);
+  TreeSitterTreeWrapper::init(env, exports);
   SyntaxNodeWrapper::init(env, exports);
   return exports;
 }

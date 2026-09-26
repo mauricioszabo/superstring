@@ -5,7 +5,7 @@
 #include <vector>
 #include "napi.h"
 #include "tree-sitter/grammar.h"
-#include "tree-sitter/language-mode.h"
+#include "tree-sitter/parser.h"
 #include "tree-sitter/query.h"
 
 // Bindings for superstring's native Tree-sitter support. Positions and
@@ -54,24 +54,37 @@ private:
   std::vector<Napi::ObjectReference> refuted_properties_objects;
 };
 
-class TreeSitterLanguageModeWrapper : public Napi::ObjectWrap<TreeSitterLanguageModeWrapper> {
+class TreeSitterParserWrapper : public Napi::ObjectWrap<TreeSitterParserWrapper> {
 public:
   static void init(Napi::Env env, Napi::Object exports);
-  explicit TreeSitterLanguageModeWrapper(const Napi::CallbackInfo &info);
-
-  std::unique_ptr<tree_sitter::LanguageMode> language_mode;
+  explicit TreeSitterParserWrapper(const Napi::CallbackInfo &info);
 
 private:
-  Napi::Value create_layer(const Napi::CallbackInfo &info);
-  void destroy_layer(const Napi::CallbackInfo &info);
-  void set_included_ranges(const Napi::CallbackInfo &info);
-  void edit(const Napi::CallbackInfo &info);
   Napi::Value parse(const Napi::CallbackInfo &info);
-  Napi::Value root_node(const Napi::CallbackInfo &info);
 
-  // Strong: nodes need the buffer for their text. The buffer doesn't
-  // reference the language mode, so this forms no cycle.
+  std::unique_ptr<tree_sitter::Parser> parser;
+};
+
+// Like web-tree-sitter's Tree. Wrappers made by `copy()` own separate trees;
+// `delete()` releases this wrapper's tree (nodes keep it alive if needed).
+class TreeSitterTreeWrapper : public Napi::ObjectWrap<TreeSitterTreeWrapper> {
+public:
+  static void init(Napi::Env env, Napi::Object exports);
+  explicit TreeSitterTreeWrapper(const Napi::CallbackInfo &info);
+
+  static Napi::Value from_tree(Napi::Env env, std::shared_ptr<tree_sitter::TreeHolder> tree,
+                               std::shared_ptr<TextBufferHandle> buffer);
+  static TreeSitterTreeWrapper *from_js(Napi::Value value);
+
+  std::shared_ptr<tree_sitter::TreeHolder> tree;
   std::shared_ptr<TextBufferHandle> buffer;
+
+private:
+  Napi::Value get_root_node(const Napi::CallbackInfo &info);
+  void edit(const Napi::CallbackInfo &info);
+  Napi::Value get_changed_ranges(const Napi::CallbackInfo &info);
+  Napi::Value copy(const Napi::CallbackInfo &info);
+  void delete_tree(const Napi::CallbackInfo &info);
 };
 
 class SyntaxNodeWrapper : public Napi::ObjectWrap<SyntaxNodeWrapper> {
@@ -106,6 +119,7 @@ private:
   Napi::Value get_has_error(const Napi::CallbackInfo &info);
   Napi::Value get_has_changes(const Napi::CallbackInfo &info);
   Napi::Value get_parent(const Napi::CallbackInfo &info);
+  Napi::Value get_tree(const Napi::CallbackInfo &info);
   Napi::Value get_child_count(const Napi::CallbackInfo &info);
   Napi::Value get_named_child_count(const Napi::CallbackInfo &info);
   Napi::Value get_children(const Napi::CallbackInfo &info);
