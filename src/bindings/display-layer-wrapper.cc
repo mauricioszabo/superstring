@@ -138,6 +138,7 @@ void DisplayLayerWrapper::init(Napi::Env env, Object exports) {
     InstanceMethod<&DisplayLayerWrapper::destroy_render_planner>("destroyRenderPlanner", napi_default_method),
     InstanceMethod<&DisplayLayerWrapper::set_class_names>("setClassNames", napi_default_method),
     InstanceMethod<&DisplayLayerWrapper::build_render_plan>("buildRenderPlan", napi_default_method),
+    StaticMethod<&DisplayLayerWrapper::set_parallel_indexing_threshold>("setParallelIndexingThreshold", napi_default_method),
   });
 
   exports.Set("DisplayLayer", func);
@@ -259,6 +260,12 @@ void DisplayLayerWrapper::write_change(const DisplayLayer::ScreenChange &change)
 void DisplayLayerWrapper::write_point(const Point &point, size_t offset) {
   scratch[offset] = coordinate_to_js(point.row);
   scratch[offset + 1] = coordinate_to_js(point.column);
+}
+
+// DisplayLayer.setParallelIndexingThreshold(rows): updates covering at least
+// this many rows compute soft wraps on worker threads (default 2000).
+void DisplayLayerWrapper::set_parallel_indexing_threshold(const CallbackInfo &info) {
+  DisplayLayer::set_parallel_indexing_threshold(coordinate_from_js(info[0]));
 }
 
 void DisplayLayerWrapper::set_params(const CallbackInfo &info) {

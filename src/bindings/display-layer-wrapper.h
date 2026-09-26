@@ -12,6 +12,7 @@
 class DisplayLayerWrapper : public Napi::ObjectWrap<DisplayLayerWrapper> {
 public:
   static void init(Napi::Env env, Napi::Object exports);
+  static void set_parallel_indexing_threshold(const Napi::CallbackInfo &info);
 
   explicit DisplayLayerWrapper(const Napi::CallbackInfo &info);
 

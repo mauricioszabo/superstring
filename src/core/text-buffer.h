@@ -44,6 +44,7 @@ public:
   bool is_modified() const;
   bool has_astral();
   std::vector<TextSlice> chunks() const;
+  std::vector<TextSlice> chunks_in_range(Range range) const;
 
   void reset(Text &&);
   void flush_changes();

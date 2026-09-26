@@ -1,7 +1,10 @@
 #include "display-layer.h"
 #include <algorithm>
+#include <deque>
 #include <iterator>
+#include <thread>
 #include "character-classes.h"
+#include "text-slice.h"
 
 using std::u16string;
 using std::vector;
@@ -1038,6 +1041,220 @@ std::map<Point, Point> DisplayLayer::compute_folds_in_buffer_row_range(uint32_t 
   return folds;
 }
 
+// Parallel indexing
+
+uint32_t DisplayLayer::parallel_indexing_threshold_ = 2000;
+
+void DisplayLayer::set_parallel_indexing_threshold(uint32_t rows) {
+  parallel_indexing_threshold_ = rows;
+}
+
+bool DisplayLayer::can_index_in_parallel() const {
+  // JS callbacks can only run on the main thread.
+  return params_.width_mode != WidthMode::Callback &&
+    params_.wrap_boundary_mode != WrapBoundaryMode::Callback;
+}
+
+// Lays out one buffer row without folds, appending its screen rows. This is
+// the per-character loop of update_spatial_index without fold handling; it
+// only reads `params_` and must not call into JS.
+void DisplayLayer::layout_row(const char16_t *line, uint32_t line_length, RowLayouts *layouts) {
+  const double soft_wrap_column = params_.soft_wrap_column;
+  const int64_t tab_length = params_.tab_length;
+  const double space_ratio = ratio_for_character(' ');
+  const int64_t length = line_length;
+
+  int64_t unexpanded_screen_column = 0;
+  int64_t expanded_screen_column = 0;
+  double screen_line_width = 0;
+  int64_t last_wrap_boundary_unexpanded_screen_column = 0;
+  int64_t last_wrap_boundary_expanded_screen_column = 0;
+  double last_wrap_boundary_screen_line_width = 0;
+  int64_t first_non_whitespace_screen_column = -1;
+  int32_t current_wrap_overflow_offset = -1;
+  double current_wrap_carried_width = 0;
+  uint32_t current_wrap_column = 0;
+  uint32_t current_wrap_indent = 0;
+  std::vector<int64_t> tab_columns;
+
+  for (int64_t buffer_column = 0; buffer_column <= length; buffer_column++) {
+    bool has_previous_character = buffer_column > 0;
+    uint16_t previous_character = has_previous_character ? line[buffer_column - 1] : 0;
+    bool has_character = buffer_column < length;
+    uint16_t character = has_character ? line[buffer_column] : 0;
+    bool character_is_tab = has_character && character == '\t';
+    bool character_is_space = has_character && character == ' ';
+
+    if (first_non_whitespace_screen_column < 0) {
+      if (!character_is_space && !character_is_tab) {
+        first_non_whitespace_screen_column = expanded_screen_column;
+      }
+    } else if (has_previous_character && has_character && is_wrap_boundary(previous_character, character, false)) {
+      last_wrap_boundary_unexpanded_screen_column = unexpanded_screen_column;
+      last_wrap_boundary_expanded_screen_column = expanded_screen_column;
+      last_wrap_boundary_screen_line_width = screen_line_width;
+    }
+
+    double character_width;
+    if (character_is_tab) {
+      character_width = space_ratio * (tab_length - (expanded_screen_column % tab_length));
+    } else if (has_character) {
+      character_width = ratio_for_character(character);
+    } else {
+      character_width = 0;
+    }
+
+    bool insert_soft_line_break =
+      screen_line_width > 0 && character_width > 0 &&
+      screen_line_width + character_width > soft_wrap_column &&
+      has_previous_character && has_character &&
+      !character_classes::is_character_pair(previous_character, character);
+
+    if (insert_soft_line_break) {
+      int64_t indent_length = (first_non_whitespace_screen_column < soft_wrap_column)
+        ? std::max<int64_t>(0, first_non_whitespace_screen_column)
+        : 0;
+      if (indent_length + params_.soft_wrap_hanging_indent < soft_wrap_column) {
+        indent_length += params_.soft_wrap_hanging_indent;
+      }
+
+      int64_t unexpanded_wrap_column = last_wrap_boundary_unexpanded_screen_column
+        ? last_wrap_boundary_unexpanded_screen_column : unexpanded_screen_column;
+      int64_t expanded_wrap_column = last_wrap_boundary_expanded_screen_column
+        ? last_wrap_boundary_expanded_screen_column : expanded_screen_column;
+      double wrap_width = last_wrap_boundary_screen_line_width
+        ? last_wrap_boundary_screen_line_width : screen_line_width;
+
+      int64_t unexpanded_screen_column_after_last_tab = indent_length;
+      int64_t expanded_screen_column_after_last_tab = indent_length;
+      size_t tab_count_preceding_wrap = 0;
+      for (size_t i = 0; i < tab_columns.size(); i++) {
+        int64_t tab_column = tab_columns[i];
+        if (tab_column < unexpanded_wrap_column) {
+          tab_count_preceding_wrap++;
+        } else {
+          int64_t tab_column_after_wrap = indent_length + tab_column - unexpanded_wrap_column;
+          expanded_screen_column_after_last_tab += tab_column_after_wrap - unexpanded_screen_column_after_last_tab;
+          expanded_screen_column_after_last_tab += tab_length - (expanded_screen_column_after_last_tab % tab_length);
+          unexpanded_screen_column_after_last_tab = tab_column_after_wrap + 1;
+          tab_columns[i - tab_count_preceding_wrap] = tab_column_after_wrap;
+        }
+      }
+      tab_columns.resize(tab_columns.size() - tab_count_preceding_wrap);
+
+      layouts->lengths.push_back(static_cast<uint32_t>(expanded_wrap_column));
+      layouts->tab_counts.push_back(tab_count_preceding_wrap);
+      layouts->wrap_columns.push_back(current_wrap_column);
+      layouts->wrap_indents.push_back(current_wrap_indent);
+      layouts->overflow_offsets.push_back(current_wrap_overflow_offset);
+      layouts->carried_widths.push_back(current_wrap_carried_width);
+      current_wrap_column = static_cast<uint32_t>(unexpanded_wrap_column);
+      current_wrap_indent = static_cast<uint32_t>(indent_length);
+      current_wrap_overflow_offset = static_cast<int32_t>(unexpanded_screen_column - unexpanded_wrap_column);
+      current_wrap_carried_width = screen_line_width - wrap_width;
+
+      unexpanded_screen_column = unexpanded_screen_column - unexpanded_wrap_column + indent_length;
+      expanded_screen_column = expanded_screen_column_after_last_tab + unexpanded_screen_column - unexpanded_screen_column_after_last_tab;
+      screen_line_width = (indent_length * space_ratio) + (screen_line_width - wrap_width);
+
+      last_wrap_boundary_unexpanded_screen_column = 0;
+      last_wrap_boundary_expanded_screen_column = 0;
+      last_wrap_boundary_screen_line_width = 0;
+    }
+
+    if (character_is_tab) {
+      tab_columns.push_back(unexpanded_screen_column);
+      int64_t distance_to_next_tab_stop = tab_length - (expanded_screen_column % tab_length);
+      expanded_screen_column += distance_to_next_tab_stop;
+      screen_line_width += distance_to_next_tab_stop * space_ratio;
+    } else {
+      expanded_screen_column++;
+      screen_line_width += character_width;
+    }
+    unexpanded_screen_column++;
+  }
+
+  layouts->lengths.push_back(static_cast<uint32_t>(expanded_screen_column - 1));
+  layouts->tab_counts.push_back(tab_columns.size());
+  layouts->wrap_columns.push_back(current_wrap_column);
+  layouts->wrap_indents.push_back(current_wrap_indent);
+  layouts->overflow_offsets.push_back(current_wrap_overflow_offset);
+  layouts->carried_widths.push_back(current_wrap_carried_width);
+  layouts->screen_row_starts.push_back(layouts->lengths.size());
+}
+
+// Collects the lines of [start_row, end_row) (pointing into the buffer's
+// text where a line is contiguous) and lays them out on worker threads.
+std::vector<DisplayLayer::RowLayouts> DisplayLayer::compute_row_layouts_in_parallel(uint32_t start_row, uint32_t end_row) {
+  struct LineText {
+    const char16_t *data;
+    uint32_t length;
+  };
+  vector<LineText> lines;
+  lines.reserve(end_row - start_row);
+  std::deque<u16string> split_lines;
+  u16string pending;
+  bool has_pending = false;
+
+  auto slices = buffer_->chunks_in_range(Range{Point(start_row, 0), Point(end_row - 1, UINT32_MAX)});
+  for (auto &slice : slices) {
+    const char16_t *data = slice.data();
+    uint32_t size = slice.size();
+    uint32_t line_start = 0;
+    for (uint32_t i = 0; i < size; i++) {
+      if (data[i] != '\n') continue;
+      if (has_pending) {
+        pending.append(data + line_start, i - line_start);
+        if (!pending.empty() && pending.back() == '\r') pending.pop_back();
+        split_lines.push_back(std::move(pending));
+        pending.clear();
+        has_pending = false;
+        lines.push_back({split_lines.back().data(), static_cast<uint32_t>(split_lines.back().size())});
+      } else {
+        uint32_t length = i - line_start;
+        if (length > 0 && data[i - 1] == '\r') length--;
+        lines.push_back({data + line_start, length});
+      }
+      line_start = i + 1;
+    }
+    if (line_start < size) {
+      pending.append(data + line_start, size - line_start);
+      has_pending = true;
+    }
+  }
+  // The last line has no newline in the range.
+  if (has_pending) {
+    split_lines.push_back(std::move(pending));
+    lines.push_back({split_lines.back().data(), static_cast<uint32_t>(split_lines.back().size())});
+  } else if (lines.size() < end_row - start_row) {
+    lines.push_back({u"", 0});
+  }
+  // Pointers into `split_lines` stay valid: deque growth doesn't move elements.
+
+  uint32_t row_count = std::min<uint32_t>(lines.size(), end_row - start_row);
+  uint32_t thread_count = std::max(1u, std::min(std::thread::hardware_concurrency(), 8u));
+  thread_count = std::min<uint32_t>(thread_count, std::max<uint32_t>(1, row_count / 256));
+
+  vector<RowLayouts> chunks(thread_count);
+  auto lay_out_chunk = [&](uint32_t chunk_index) {
+    uint32_t chunk_start = row_count * static_cast<uint64_t>(chunk_index) / thread_count;
+    uint32_t chunk_end = row_count * static_cast<uint64_t>(chunk_index + 1) / thread_count;
+    RowLayouts &layouts = chunks[chunk_index];
+    layouts.first_row = start_row + chunk_start;
+    layouts.screen_row_starts.reserve(chunk_end - chunk_start + 1);
+    layouts.screen_row_starts.push_back(0);
+    for (uint32_t i = chunk_start; i < chunk_end; i++) {
+      layout_row(lines[i].data, lines[i].length, &layouts);
+    }
+  };
+
+  vector<std::thread> threads;
+  for (uint32_t i = 1; i < thread_count; i++) threads.emplace_back(lay_out_chunk, i);
+  lay_out_chunk(0);
+  for (auto &thread : threads) thread.join();
+  return chunks;
+}
+
 DisplayLayer::ScreenChange DisplayLayer::update_spatial_index(uint32_t start_buffer_row, uint32_t old_end_buffer_row,
                                                               uint32_t new_end_buffer_row, uint32_t end_screen_row,
                                                               const TimeRemaining *time_remaining) {
@@ -1060,6 +1277,31 @@ DisplayLayer::ScreenChange DisplayLayer::update_spatial_index(uint32_t start_buf
 
   auto folds = compute_folds_in_buffer_row_range(start_buffer_row, new_end_buffer_row);
   auto next_fold = folds.begin();
+
+  // Lay out large ranges of rows in parallel. Rows touched by folds still go
+  // through the loop below. When only some screen rows are needed, don't
+  // compute many more buffer rows than that.
+  vector<RowLayouts> row_layouts;
+  size_t row_layouts_index = 0;
+  uint32_t parallel_end_row = new_end_buffer_row;
+  if (end_screen_row != INF) {
+    uint64_t needed_rows = static_cast<uint64_t>(end_screen_row) - std::min(end_screen_row, start_screen_row);
+    parallel_end_row = std::min<uint64_t>(new_end_buffer_row, static_cast<uint64_t>(start_buffer_row) + needed_rows);
+  }
+  parallel_end_row = std::min(parallel_end_row, line_count());
+  if (!time_remaining && can_index_in_parallel() &&
+      parallel_end_row > start_buffer_row &&
+      parallel_end_row - start_buffer_row >= parallel_indexing_threshold_) {
+    row_layouts = compute_row_layouts_in_parallel(start_buffer_row, parallel_end_row);
+  }
+  std::unordered_map<uint32_t, bool> rows_with_folds;
+  if (!row_layouts.empty()) {
+    for (auto &fold : folds) {
+      for (uint32_t fold_row = fold.first.row; fold_row <= fold.second.row && fold_row < parallel_end_row; fold_row++) {
+        rows_with_folds[fold_row] = true;
+      }
+    }
+  }
 
   vector<uint32_t> inserted_screen_line_lengths;
   vector<uint32_t> inserted_tab_counts;
@@ -1093,6 +1335,37 @@ DisplayLayer::ScreenChange DisplayLayer::update_spatial_index(uint32_t start_buf
     if (screen_row >= end_screen_row && buffer_column == 0) break;
     if (time_remaining && (*time_remaining)() < 2) break;
     if (buffer_row >= buffer_line_count) break;
+
+    // Apply a precomputed layout.
+    if (buffer_column == 0 && buffer_row < parallel_end_row && !row_layouts.empty() && !rows_with_folds.count(buffer_row)) {
+      while (row_layouts_index + 1 < row_layouts.size() && row_layouts[row_layouts_index + 1].first_row <= buffer_row) {
+        row_layouts_index++;
+      }
+      RowLayouts &layouts = row_layouts[row_layouts_index];
+      uint32_t index = buffer_row - layouts.first_row;
+      if (index + 1 < layouts.screen_row_starts.size()) {
+        uint32_t begin = layouts.screen_row_starts[index];
+        uint32_t end = layouts.screen_row_starts[index + 1];
+        for (uint32_t i = begin; i < end; i++) {
+          if (i > begin) {
+            spatial_index_.splice(Point(screen_row, layouts.wrap_columns[i]), Point(0, 0), Point(1, layouts.wrap_indents[i]));
+            screen_row++;
+          }
+          inserted_screen_line_lengths.push_back(layouts.lengths[i]);
+          inserted_tab_counts.push_back(layouts.tab_counts[i]);
+          inserted_wrap_overflow_offsets.push_back(layouts.overflow_offsets[i]);
+          inserted_wrap_carried_widths.push_back(layouts.carried_widths[i]);
+          if (static_cast<int64_t>(layouts.lengths[i]) > rightmost_inserted_column) {
+            rightmost_inserted_row = screen_row;
+            rightmost_inserted_column = layouts.lengths[i];
+          }
+        }
+        buffer_row++;
+        screen_row++;
+        continue;
+      }
+    }
+
     buffer_line = line_for_row(buffer_row);
     int64_t buffer_line_length = buffer_line.size();
     current_screen_line_tab_columns.clear();

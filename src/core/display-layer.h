@@ -152,6 +152,10 @@ public:
   int64_t indexed_buffer_row_count() const { return indexed_buffer_row_count_; }
   uint32_t computed_screen_line_count() const { return screen_line_lengths_.size(); }
 
+  // Updates covering at least this many buffer rows compute soft wraps on
+  // worker threads (when widths and wrap boundaries aren't JS callbacks).
+  static void set_parallel_indexing_threshold(uint32_t rows);
+
   // Phase 1 of building screen lines: returns the buffer segments whose
   // highlight boundaries are needed, and the end buffer row to seek with.
   std::vector<HighlightSegmentRequest> prepare_screen_lines(uint32_t start_screen_row,
@@ -189,6 +193,28 @@ private:
     Point start;
     Point end;
   };
+
+  // Soft-wrap layouts of a range of buffer rows without folds, computed off
+  // the main thread. Screen rows of buffer row `first_row + i` are
+  // [screen_row_starts[i], screen_row_starts[i + 1]); `wrap_columns` and
+  // `wrap_indents` describe the wrap that starts each screen row (unused for
+  // a buffer row's first screen row), with the column relative to the
+  // previous screen row.
+  struct RowLayouts {
+    uint32_t first_row = 0;
+    std::vector<uint32_t> screen_row_starts;
+    std::vector<uint32_t> lengths;
+    std::vector<uint32_t> tab_counts;
+    std::vector<uint32_t> wrap_columns;
+    std::vector<uint32_t> wrap_indents;
+    std::vector<int32_t> overflow_offsets;
+    std::vector<double> carried_widths;
+  };
+
+  static uint32_t parallel_indexing_threshold_;
+  bool can_index_in_parallel() const;
+  std::vector<RowLayouts> compute_row_layouts_in_parallel(uint32_t start_row, uint32_t end_row);
+  void layout_row(const char16_t *line, uint32_t line_length, RowLayouts *layouts);
 
   uint32_t line_count() const;
   uint32_t last_row() const;
