@@ -177,6 +177,20 @@ void DisplayLayer::invalidate_line_cache() {
   cached_line_row_ = INF;
 }
 
+// The cached line survives across calls, so that e.g. translating many
+// positions on one long line copies it once. It is dropped whenever we are
+// told about a buffer change, and as a safety net whenever the buffer's size
+// or extent differ from when it was cached.
+void DisplayLayer::validate_line_cache() {
+  uint32_t size = buffer_->size();
+  Point extent = buffer_->extent();
+  if (size != cached_line_buffer_size_ || extent != cached_line_buffer_extent_) {
+    cached_line_row_ = INF;
+    cached_line_buffer_size_ = size;
+    cached_line_buffer_extent_ = extent;
+  }
+}
+
 // Character metrics
 
 double DisplayLayer::ratio_for_character(uint16_t character) {
@@ -244,7 +258,7 @@ Point DisplayLayer::clip_buffer_position(double row, double column) {
 }
 
 Point DisplayLayer::translate_buffer_position(double row, double column, ClipDirection clip_direction) {
-  invalidate_line_cache();
+  validate_line_cache();
   Point buffer_position = clip_buffer_position(row, column);
   populate_spatial_index_if_needed(saturating_add(buffer_position.row, 1), INF);
 
@@ -287,7 +301,7 @@ Point DisplayLayer::translate_buffer_position_with_spatial_index(Point position,
 
 Point DisplayLayer::translate_screen_position(double row, double column, ClipDirection clip_direction,
                                               bool skip_soft_wrap_indentation, bool *out_of_range) {
-  invalidate_line_cache();
+  validate_line_cache();
   *out_of_range = false;
   if (row + 1 > 0) {
     populate_spatial_index_if_needed(line_count(), row + 1 >= INF ? INF : to_coordinate(row + 1));
@@ -543,7 +557,7 @@ int64_t DisplayLayer::get_clip_column_delta(Point buffer_position, ClipDirection
 // Queries
 
 uint32_t DisplayLayer::get_screen_line_count() {
-  invalidate_line_cache();
+  validate_line_cache();
   populate_spatial_index_if_needed(line_count(), INF);
   return screen_line_lengths_.size();
 }
@@ -559,7 +573,7 @@ uint32_t DisplayLayer::get_approximate_screen_line_count() {
 }
 
 Point DisplayLayer::get_rightmost_screen_position() {
-  invalidate_line_cache();
+  validate_line_cache();
   populate_spatial_index_if_needed(line_count(), INF);
   return rightmost_screen_position_;
 }
@@ -569,14 +583,14 @@ Point DisplayLayer::get_approximate_rightmost_screen_position() {
 }
 
 optional<uint32_t> DisplayLayer::line_length_for_screen_row(uint32_t screen_row) {
-  invalidate_line_cache();
+  validate_line_cache();
   populate_spatial_index_if_needed(line_count(), saturating_add(screen_row, 1));
   if (screen_row < screen_line_lengths_.size()) return screen_line_lengths_[screen_row];
   return optional<uint32_t>{};
 }
 
 vector<uint32_t> DisplayLayer::buffer_rows_for_screen_rows(uint32_t start_row, uint32_t end_row) {
-  invalidate_line_cache();
+  validate_line_cache();
   populate_spatial_index_if_needed(line_count(), end_row);
 
   Point start_position(start_row, 0);
@@ -815,6 +829,8 @@ void DisplayLayer::buffer_will_change(uint32_t old_end_row) {
     end_row++;
   }
   populate_spatial_index_if_needed(end_row + 1, INF);
+  // The buffer changes next; don't let anything read the old lines.
+  invalidate_line_cache();
 }
 
 DisplayLayer::ScreenChange DisplayLayer::buffer_did_change(uint32_t start_row, uint32_t old_end_row,
@@ -842,7 +858,7 @@ DisplayLayer::ScreenChange DisplayLayer::buffer_did_change(uint32_t start_row, u
 }
 
 DisplayLayer::ScreenChange DisplayLayer::invalidate_highlighting(uint32_t start_row, uint32_t end_row) {
-  invalidate_line_cache();
+  validate_line_cache();
   populate_spatial_index_if_needed(saturating_add(end_row, 1), INF);
   uint32_t start_buffer_row = find_boundary_preceding_buffer_row(start_row);
   uint32_t end_buffer_row = find_boundary_following_buffer_row(saturating_add(end_row, 1));
@@ -877,7 +893,7 @@ void DisplayLayer::splice_cache(uint32_t start, uint32_t old_count, uint32_t new
 // Spatial index
 
 bool DisplayLayer::do_background_work(const TimeRemaining &time_remaining) {
-  invalidate_line_cache();
+  validate_line_cache();
   populate_spatial_index_if_needed(line_count(), INF, &time_remaining);
   return indexed_buffer_row_count_ < line_count();
 }
@@ -933,7 +949,7 @@ uint32_t DisplayLayer::find_boundary_following_buffer_row(uint32_t buffer_row) {
 }
 
 std::pair<uint32_t, uint32_t> DisplayLayer::find_boundary_following_screen_row(uint32_t screen_row) {
-  invalidate_line_cache();
+  validate_line_cache();
   while (true) {
     Point buffer_position = translate_screen_position_with_spatial_index(
       Point(screen_row, 0), ClipDirection::Forward, false
@@ -1363,7 +1379,6 @@ public:
     bool did_seek_decoration_iterator = false;
     containing_scope_ids.clear();
     scope_ids_to_reopen.clear();
-    buffer_position.column = 0;
     begin_line();
     uint32_t last_row = layer.last_row();
     bool in_run = false;
@@ -1418,13 +1433,10 @@ public:
         }
       }
 
-      const ScreenLine *previous_cached_screen_line =
-        screen_row > 0 ? layer.cached_screen_line(screen_row - 1) : nullptr;
-      if (previous_cached_screen_line && previous_cached_screen_line->soft_wrap_indent >= 0) {
+      int32_t soft_wrap_indent = soft_wrap_indent_for_row(screen_row);
+      if (soft_wrap_indent >= 0) {
         in_leading_whitespace = false;
-        if (previous_cached_screen_line->soft_wrap_indent > 0) {
-          emit_indent_whitespace(previous_cached_screen_line->soft_wrap_indent);
-        }
+        if (soft_wrap_indent > 0) emit_indent_whitespace(soft_wrap_indent);
       }
 
       // This loop may visit multiple buffer rows if there are folds and
@@ -1505,6 +1517,8 @@ private:
   uint32_t end_buffer_row;
   vector<Patch::Change> hunks;
   size_t hunk_index;
+  uint32_t first_screen_row;
+  int32_t initial_soft_wrap_indent;
 
   Point buffer_position;
   uint32_t screen_row;
@@ -1526,18 +1540,35 @@ private:
   void begin(uint32_t start_screen_row, uint32_t end_screen_row) {
     layer.populate_spatial_index_if_needed(layer.line_count(), end_screen_row);
 
-    buffer_position = Point(
-      layer.find_boundary_preceding_buffer_row(
-        layer.translate_screen_position_with_spatial_index(
-          Point(start_screen_row, 0), ClipDirection::Unspecified, false
-        ).row
-      ),
-      0
-    );
+    // If the first row continues a soft-wrapped buffer line, start right at
+    // the wrap instead of at the start of the buffer line: on very long lines
+    // that would mean building every screen row before the requested ones.
+    initial_soft_wrap_indent = -1;
+    first_screen_row = start_screen_row;
+    Point screen_start(start_screen_row, 0);
+    auto wrap = start_screen_row > 0
+      ? layer.spatial_index_.grab_change_starting_before_new_position(screen_start)
+      : optional<Patch::Change>{};
+    if (wrap && is_soft_wrap_hunk(*wrap) &&
+        wrap->new_start.row + 1 == start_screen_row &&
+        wrap->new_end.row == start_screen_row) {
+      buffer_position = wrap->old_start;
+      screen_row = start_screen_row;
+      initial_soft_wrap_indent = wrap->new_end.column;
+    } else {
+      buffer_position = Point(
+        layer.find_boundary_preceding_buffer_row(
+          layer.translate_screen_position_with_spatial_index(
+            screen_start, ClipDirection::Unspecified, false
+          ).row
+        ),
+        0
+      );
 
-    screen_row = layer.translate_buffer_position_with_spatial_index(
-      Point(buffer_position.row, 0), ClipDirection::Unspecified
-    ).row;
+      screen_row = layer.translate_buffer_position_with_spatial_index(
+        Point(buffer_position.row, 0), ClipDirection::Unspecified
+      ).row;
+    }
 
     end_buffer_row = layer.translate_screen_position_with_spatial_index(
       Point(end_screen_row, INF), ClipDirection::Unspecified, false
@@ -1545,7 +1576,18 @@ private:
 
     hunks = layer.spatial_index_.grab_changes_in_new_range(Point(screen_row, 0), Point(end_screen_row, 0));
     hunk_index = 0;
+    // Skip the soft wrap we are starting after.
+    while (hunk_index < hunks.size() && hunks[hunk_index].new_start < Point(screen_row, 0)) {
+      hunk_index++;
+    }
     screen_column = 0;
+  }
+
+  // The soft wrap indent of the screen row that starts a build, or -1.
+  int32_t soft_wrap_indent_for_row(uint32_t row) const {
+    if (row == first_screen_row && initial_soft_wrap_indent >= 0) return initial_soft_wrap_indent;
+    const ScreenLine *previous = row > 0 ? layer.cached_screen_line(row - 1) : nullptr;
+    return previous ? previous->soft_wrap_indent : -1;
   }
 
   // Mirrors how the JS builder advances past a cached screen row.
@@ -1876,7 +1918,7 @@ private:
 vector<DisplayLayer::HighlightSegmentRequest> DisplayLayer::prepare_screen_lines(uint32_t start_screen_row,
                                                                                  uint32_t end_screen_row,
                                                                                  uint32_t *end_buffer_row) {
-  invalidate_line_cache();
+  validate_line_cache();
   ScreenLineBuilder builder(*this);
   return builder.collect_segments(start_screen_row, end_screen_row, end_buffer_row);
 }
@@ -1884,7 +1926,7 @@ vector<DisplayLayer::HighlightSegmentRequest> DisplayLayer::prepare_screen_lines
 bool DisplayLayer::build_screen_lines(uint32_t start_screen_row, uint32_t end_screen_row,
                                       const vector<HighlightSegment> &segments, bool strict,
                                       vector<const ScreenLine *> *result) {
-  invalidate_line_cache();
+  validate_line_cache();
   ScreenLineBuilder builder(*this);
   return builder.build(start_screen_row, end_screen_row, segments, strict, result);
 }

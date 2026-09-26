@@ -193,6 +193,7 @@ private:
   uint32_t line_length(uint32_t row);
   const std::u16string &line_for_row(uint32_t row);
   void invalidate_line_cache();
+  void validate_line_cache();
 
   double ratio_for_character(uint16_t character);
   double ratio_for_fold_character();
@@ -247,6 +248,8 @@ private:
 
   uint32_t cached_line_row_;
   std::u16string cached_line_;
+  uint32_t cached_line_buffer_size_ = UINT32_MAX;
+  Point cached_line_buffer_extent_;
 };
 
 #endif  // SUPERSTRING_DISPLAY_LAYER_H_
