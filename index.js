@@ -355,4 +355,8 @@ module.exports = {
   Patch: binding.Patch,
   MarkerIndex: binding.MarkerIndex,
   DisplayLayer: binding.DisplayLayer,
+  TreeSitterGrammar: binding.TreeSitterGrammar,
+  TreeSitterQuery: binding.TreeSitterQuery,
+  TreeSitterLanguageMode: binding.TreeSitterLanguageMode,
+  SyntaxNode: binding.SyntaxNode,
 }

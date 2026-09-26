@@ -9,6 +9,7 @@
             "sources": [
                 "src/bindings/bindings.cc",
                 "src/bindings/display-layer-wrapper.cc",
+                "src/bindings/tree-sitter-wrapper.cc",
                 "src/bindings/marker-index-wrapper.cc",
                 "src/bindings/patch-wrapper.cc",
                 "src/bindings/point-wrapper.cc",
@@ -64,6 +65,9 @@
             "export_dependent_settings": ["tree_sitter"],
             "sources": [
                 "src/core/tree-sitter/wasm-engine.cc",
+                "src/core/tree-sitter/grammar.cc",
+                "src/core/tree-sitter/query.cc",
+                "src/core/tree-sitter/language-mode.cc",
             ],
             "include_dirs": [
                 "src/core",

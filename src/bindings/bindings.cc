@@ -1,5 +1,6 @@
 #include "addon-data.h"
 #include "display-layer-wrapper.h"
+#include "tree-sitter-wrapper.h"
 #include "marker-index-wrapper.h"
 #include "patch-wrapper.h"
 #include "range-wrapper.h"
@@ -21,6 +22,10 @@ Object Init(Env env, Object exports) {
   TextReader::init(env, exports);
   TextBufferSnapshotWrapper::init(env);
   DisplayLayerWrapper::init(env, exports);
+  TreeSitterGrammarWrapper::init(env, exports);
+  TreeSitterQueryWrapper::init(env, exports);
+  TreeSitterLanguageModeWrapper::init(env, exports);
+  SyntaxNodeWrapper::init(env, exports);
   return exports;
 }
 

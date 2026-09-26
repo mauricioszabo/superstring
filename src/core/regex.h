@@ -15,8 +15,10 @@ class Regex {
 
  public:
   Regex();
-  Regex(const char16_t *, uint32_t, std::u16string *error_message, bool ignore_case = false, bool unicode = false);
-  Regex(const std::u16string &, std::u16string *error_message, bool ignore_case = false, bool unicode = false);
+  Regex(const char16_t *, uint32_t, std::u16string *error_message, bool ignore_case = false, bool unicode = false,
+        bool multiline = true);
+  Regex(const std::u16string &, std::u16string *error_message, bool ignore_case = false, bool unicode = false,
+        bool multiline = true);
   Regex(Regex &&);
   ~Regex();
 
