@@ -68,6 +68,7 @@
                 "src/core/tree-sitter/grammar.cc",
                 "src/core/tree-sitter/query.cc",
                 "src/core/tree-sitter/parser.cc",
+                "src/core/tree-sitter/scope-resolver.cc",
             ],
             "include_dirs": [
                 "src/core",

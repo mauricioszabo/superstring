@@ -5,6 +5,7 @@
 #include "text-slice.h"
 #include "wasm-engine.h"
 
+using std::string;
 using std::vector;
 
 namespace tree_sitter {
@@ -77,6 +78,81 @@ std::u16string text_for_node(TextBuffer *buffer, TSNode node) {
     if (result.size() >= end - start) break;
   }
   return result;
+}
+
+vector<TSSymbol> symbols_for_types(const TSLanguage *language, const vector<string> &types) {
+  vector<TSSymbol> symbols;
+  for (auto &type : types) {
+    if (type == "ERROR") symbols.push_back(65535);
+  }
+  uint32_t symbol_count = ts_language_symbol_count(language);
+  for (uint32_t symbol = 0; symbol < symbol_count; symbol++) {
+    const char *name = ts_language_symbol_name(language, symbol);
+    if (!name) continue;
+    for (auto &type : types) {
+      if (type == name) {
+        symbols.push_back(symbol);
+        break;
+      }
+    }
+  }
+  return symbols;
+}
+
+namespace {
+
+bool point_lte(TSPoint a, TSPoint b) {
+  return a.row < b.row || (a.row == b.row && a.column <= b.column);
+}
+
+}  // namespace
+
+void descendants_of_type(TSNode node, const vector<TSSymbol> &symbols, TSPoint start_point, TSPoint end_point,
+                         vector<TSNode> *result, bool first_only) {
+  auto contains = [&](TSSymbol symbol) {
+    for (TSSymbol s : symbols) if (s == symbol) return true;
+    return false;
+  };
+  if (end_point.row == 0 && end_point.column == 0) end_point = {UINT32_MAX, UINT32_MAX};
+
+  TSTreeCursor cursor = ts_tree_cursor_new(node);
+  bool already_visited_children = false;
+  while (true) {
+    TSNode descendant = ts_tree_cursor_current_node(&cursor);
+    if (!already_visited_children) {
+      // Skip nodes before the range without descending into them.
+      if (point_lte(ts_node_end_point(descendant), start_point)) {
+        if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+          already_visited_children = false;
+        } else {
+          if (!ts_tree_cursor_goto_parent(&cursor)) break;
+          already_visited_children = true;
+        }
+        continue;
+      }
+      // Stop at the first node after the range.
+      if (point_lte(end_point, ts_node_start_point(descendant))) break;
+      if (contains(ts_node_symbol(descendant))) {
+        result->push_back(descendant);
+        if (first_only) break;
+      }
+      if (ts_tree_cursor_goto_first_child(&cursor)) {
+        already_visited_children = false;
+      } else if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+        already_visited_children = false;
+      } else {
+        if (!ts_tree_cursor_goto_parent(&cursor)) break;
+        already_visited_children = true;
+      }
+    } else {
+      if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+        already_visited_children = false;
+      } else {
+        if (!ts_tree_cursor_goto_parent(&cursor)) break;
+      }
+    }
+  }
+  ts_tree_cursor_delete(&cursor);
 }
 
 Parser::Parser(std::shared_ptr<Grammar> grammar) : grammar_{std::move(grammar)}, parser_{ts_parser_new()} {

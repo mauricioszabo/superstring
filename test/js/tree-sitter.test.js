@@ -71,6 +71,56 @@ describe('native Tree-sitter', () => {
     assert.throws(() => grammar.query('((string) @s (#eq? @s))'), /Wrong number of arguments to `#eq\?` predicate/)
   })
 
+  it('resolves highlights like Pulsar\'s ScopeResolver', () => {
+    const {root} = parse('{"a": 1, "bb": 2}')
+    const query = grammar.query(`
+      (object) @meta.object
+      ((pair) @meta.pair (#is? test.firstOfType))
+      ((pair) @meta.value (#set! adjust.startAt lastChild.startPosition))
+      ((string) @_IGNORE_ (#set! capture.final))
+      (string) @string.quoted
+      (string_content) @key._TEXT_
+      ((number) @constant.numeric (#is? test.config "editor.flag true") (#set! highlight.invalidateOnChange))
+    `)
+    const configKeys = []
+    const result = query.highlights(root, {
+      startPosition: {row: 0, column: 0},
+      endPosition: {row: 0, column: 17},
+      injection: false,
+      config: (key) => { configKeys.push(key); return true }
+    })
+
+    const names = query.highlightScopeNames()
+    assert.equal(result.scopeNameCount, names.length)
+    assert.deepEqual(query.highlightScopeNames(4), names.slice(4))
+    const boundaries = []
+    const data = result.boundaries
+    for (let i = 0; i < data.length;) {
+      const [row, column, closeCount, openCount] = data.slice(i, i + 4)
+      i += 4
+      const close = Array.from(data.slice(i, i + closeCount), (n) => names[n])
+      i += closeCount
+      const open = Array.from(data.slice(i, i + openCount), (n) => names[n])
+      i += openCount
+      boundaries.push([row, column, close, open])
+    }
+    assert.deepEqual(boundaries, [
+      [0, 0, [], ['meta.object']],
+      [0, 1, [], ['meta.pair']],
+      [0, 2, [], ['key.a']],
+      [0, 3, ['key.a'], []],
+      [0, 6, [], ['meta.value', 'constant.numeric']],
+      [0, 7, ['constant.numeric', 'meta.value', 'meta.pair'], []],
+      [0, 10, [], ['key.bb']],
+      [0, 12, ['key.bb'], []],
+      [0, 15, [], ['meta.value', 'constant.numeric']],
+      [0, 16, ['constant.numeric', 'meta.value'], []],
+      [0, 17, ['meta.object'], []]
+    ])
+    assert.deepEqual(configKeys, ['editor.flag', 'editor.flag'])
+    assert.deepEqual(result.invalidatedNodeIds, root.descendantsOfType('number').map((n) => n.id))
+  })
+
   it('reparses incrementally after edits, reporting changed ranges', () => {
     const {buffer, parser, tree} = parse('[1, 2, 3]')
     const copy = tree.copy()

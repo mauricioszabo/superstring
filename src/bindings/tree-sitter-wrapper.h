@@ -7,6 +7,7 @@
 #include "tree-sitter/grammar.h"
 #include "tree-sitter/parser.h"
 #include "tree-sitter/query.h"
+#include "tree-sitter/scope-resolver.h"
 
 // Bindings for superstring's native Tree-sitter support. Positions and
 // indexes use the buffer's UTF-16 code units, like web-tree-sitter's; nodes
@@ -44,6 +45,8 @@ public:
 private:
   Napi::Value get_capture_names(const Napi::CallbackInfo &info);
   Napi::Value captures(const Napi::CallbackInfo &info);
+  Napi::Value highlights(const Napi::CallbackInfo &info);
+  Napi::Value highlight_scope_names(const Napi::CallbackInfo &info);
   Napi::Value properties_object(Napi::Env env, std::vector<Napi::ObjectReference> *cache,
                                 uint32_t pattern, const std::vector<tree_sitter::QueryProperty> &properties);
 
@@ -52,6 +55,8 @@ private:
   std::vector<Napi::ObjectReference> set_properties_objects;
   std::vector<Napi::ObjectReference> asserted_properties_objects;
   std::vector<Napi::ObjectReference> refuted_properties_objects;
+  // Created on the first `highlights` call.
+  std::unique_ptr<tree_sitter::ScopeResolver> scope_resolver;
 };
 
 class TreeSitterParserWrapper : public Napi::ObjectWrap<TreeSitterParserWrapper> {

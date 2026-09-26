@@ -55,6 +55,7 @@ public:
   bool has_asserted_properties(uint32_t pattern) const { return patterns_[pattern].has_asserted_properties; }
   bool has_refuted_properties(uint32_t pattern) const { return patterns_[pattern].has_refuted_properties; }
   const TSQuery *ts_query() const { return query_; }
+  const TSLanguage *language() const;
 
 private:
   struct TextPredicate {

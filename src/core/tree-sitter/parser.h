@@ -31,6 +31,16 @@ inline TSPoint point_to_ts(Point point) {
 // The buffer's text for a node, read by offset.
 std::u16string text_for_node(TextBuffer *buffer, TSNode node);
 
+// The symbols of the named node types, as web-tree-sitter's
+// `descendantsOfType` resolves them (including "ERROR").
+std::vector<TSSymbol> symbols_for_types(const TSLanguage *language, const std::vector<std::string> &types);
+
+// Mirrors web-tree-sitter's `descendantsOfType`, including the node itself
+// and its handling of positions (bytes; a zero end point means no limit).
+// With `first_only`, stops at the first result.
+void descendants_of_type(TSNode node, const std::vector<TSSymbol> &symbols, TSPoint start, TSPoint end,
+                         std::vector<TSNode> *result, bool first_only = false);
+
 // A Tree-sitter parser for one grammar, with a wasm store of its own.
 // Parsing reads a native TextBuffer's text directly.
 class Parser {

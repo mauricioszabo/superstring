@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include "tree-sitter-wrapper.h"
 #include "addon-data.h"
 #include "text-buffer-wrapper.h"
@@ -109,6 +111,8 @@ void TreeSitterQueryWrapper::init(Napi::Env env, Object exports) {
   Function func = DefineClass(env, "TreeSitterQuery", {
     InstanceAccessor<&TreeSitterQueryWrapper::get_capture_names>("captureNames"),
     InstanceMethod<&TreeSitterQueryWrapper::captures>("captures", napi_default_method),
+    InstanceMethod<&TreeSitterQueryWrapper::highlights>("highlights", napi_default_method),
+    InstanceMethod<&TreeSitterQueryWrapper::highlight_scope_names>("highlightScopeNames", napi_default_method),
   });
   data->tree_sitter_query_constructor = Persistent(func);
   exports.Set("TreeSitterQuery", func);
@@ -222,6 +226,100 @@ Napi::Value TreeSitterQueryWrapper::captures(const CallbackInfo &info) {
       : env.Undefined());
     result[i] = object;
   }
+  return result;
+}
+
+// query.highlights(rootNode, {startPosition, endPosition, injection, config})
+//   -> {boundaries, invalidatedNodeIds, scopeNameCount}
+//
+// Resolves a highlights query's captures within the range the way
+// `ScopeResolver` does. `boundaries` is a Uint32Array of, for each position in
+// order, `row, column, closeCount, openCount`, then the scopes to close and
+// the scopes to open, as indexes into `highlightScopeNames()`.
+// `config(key)` returns the config value that `test.config` checks.
+Napi::Value TreeSitterQueryWrapper::highlights(const CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  SyntaxNodeWrapper *node = SyntaxNodeWrapper::from_js(info[0]);
+  if (!node || !info[1].IsObject()) {
+    Error::New(env, "Expected (node, options)").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  Object options = info[1].As<Object>();
+  auto position_from_js = [](const Napi::Value &value) {
+    if (!value.IsObject()) return Point();
+    Object object = value.As<Object>();
+    return Point(i32_from_js(object.Get("row")), i32_from_js(object.Get("column")));
+  };
+  Point from = position_from_js(options.Get("startPosition"));
+  Point to = position_from_js(options.Get("endPosition"));
+
+  Napi::Value config = options.Get("config");
+  tree_sitter::HighlightContext context;
+  context.buffer = node->buffer->buffer;
+  context.injection = options.Get("injection").ToBoolean();
+  if (config.IsFunction()) {
+    Function config_function = config.As<Function>();
+    // `ScopeResolver.TESTS.config`, with `interpretPredicateValue`.
+    context.config = [env, config_function](const string &key, const optional<string> &value) {
+      if (env.IsExceptionPending()) return false;
+      Napi::Value config_value = config_function.Call({String::New(env, key)});
+      if (env.IsExceptionPending()) return false;
+      if (config_value.IsNull() || config_value.IsUndefined()) config_value = Boolean::New(env, false);
+      if (!value) return config_value.ToBoolean().Value();
+      Napi::Value expected;
+      if (*value == "true") {
+        expected = Boolean::New(env, true);
+      } else if (*value == "false") {
+        expected = Boolean::New(env, false);
+      } else if (!value->empty() && std::all_of(value->begin(), value->end(), [](char c) { return c >= '0' && c <= '9'; })) {
+        expected = Number::New(env, std::strtod(value->c_str(), nullptr));
+      } else {
+        expected = String::New(env, *value);
+      }
+      return config_value.StrictEquals(expected);
+    };
+  }
+
+  if (!scope_resolver) scope_resolver.reset(new tree_sitter::ScopeResolver(query));
+  vector<tree_sitter::HighlightBoundary> boundaries;
+  vector<const void *> invalidated_node_ids;
+  scope_resolver->resolve(node->node, from, to, context, &boundaries, &invalidated_node_ids);
+  if (env.IsExceptionPending()) return env.Undefined();
+
+  size_t length = 0;
+  for (auto &boundary : boundaries) length += 4 + boundary.close.size() + boundary.open.size();
+  Uint32Array data = Uint32Array::New(env, length);
+  uint32_t *cursor = data.Data();
+  for (auto &boundary : boundaries) {
+    *cursor++ = boundary.position.row;
+    *cursor++ = boundary.position.column;
+    *cursor++ = boundary.close.size();
+    *cursor++ = boundary.open.size();
+    for (uint32_t id : boundary.close) *cursor++ = id;
+    for (uint32_t id : boundary.open) *cursor++ = id;
+  }
+
+  Array ids = Array::New(env, invalidated_node_ids.size());
+  for (size_t i = 0; i < invalidated_node_ids.size(); i++) {
+    ids[i] = Number::New(env, static_cast<double>(reinterpret_cast<uintptr_t>(invalidated_node_ids[i])));
+  }
+
+  Object result = Object::New(env);
+  result.Set("boundaries", data);
+  result.Set("invalidatedNodeIds", ids);
+  result.Set("scopeNameCount", Number::New(env, scope_resolver->scope_names().size()));
+  return result;
+}
+
+// query.highlightScopeNames(start = 0) -> the scope names `highlights`
+// boundaries refer to, from index `start` on.
+Napi::Value TreeSitterQueryWrapper::highlight_scope_names(const CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  if (!scope_resolver) return Array::New(env, 0);
+  auto &names = scope_resolver->scope_names();
+  uint32_t start = std::min<size_t>(info[0].IsNumber() ? i32_from_js(info[0]) : 0, names.size());
+  Array result = Array::New(env, names.size() - start);
+  for (size_t i = start; i < names.size(); i++) result[i - start] = String::New(env, names[i]);
   return result;
 }
 
@@ -612,67 +710,11 @@ Napi::Value SyntaxNodeWrapper::descendants_of_type(const CallbackInfo &info) {
     types.push_back(info[0].As<String>().Utf8Value());
   }
 
-  const TSLanguage *language = ts_tree_language(tree->tree);
-  vector<TSSymbol> symbols;
-  for (auto &type : types) {
-    if (type == "ERROR") symbols.push_back(65535);
-  }
-  uint32_t symbol_count = ts_language_symbol_count(language);
-  for (uint32_t symbol = 0; symbol < symbol_count; symbol++) {
-    const char *name = ts_language_symbol_name(language, symbol);
-    if (!name) continue;
-    for (auto &type : types) {
-      if (type == name) {
-        symbols.push_back(symbol);
-        break;
-      }
-    }
-  }
-  auto contains = [&](TSSymbol symbol) {
-    for (TSSymbol s : symbols) if (s == symbol) return true;
-    return false;
-  };
-
   TSPoint start_point = info[1].IsObject() ? point_from_js(info[1]) : TSPoint{0, 0};
   TSPoint end_point = info[2].IsObject() ? point_from_js(info[2]) : TSPoint{0, 0};
-  if (end_point.row == 0 && end_point.column == 0) end_point = {UINT32_MAX, UINT32_MAX};
-
   vector<TSNode> result;
-  TSTreeCursor cursor = ts_tree_cursor_new(node);
-  bool already_visited_children = false;
-  while (true) {
-    TSNode descendant = ts_tree_cursor_current_node(&cursor);
-    if (!already_visited_children) {
-      // Skip nodes before the range without descending into them.
-      if (point_lte(ts_node_end_point(descendant), start_point)) {
-        if (ts_tree_cursor_goto_next_sibling(&cursor)) {
-          already_visited_children = false;
-        } else {
-          if (!ts_tree_cursor_goto_parent(&cursor)) break;
-          already_visited_children = true;
-        }
-        continue;
-      }
-      // Stop at the first node after the range.
-      if (point_lte(end_point, ts_node_start_point(descendant))) break;
-      if (contains(ts_node_symbol(descendant))) result.push_back(descendant);
-      if (ts_tree_cursor_goto_first_child(&cursor)) {
-        already_visited_children = false;
-      } else if (ts_tree_cursor_goto_next_sibling(&cursor)) {
-        already_visited_children = false;
-      } else {
-        if (!ts_tree_cursor_goto_parent(&cursor)) break;
-        already_visited_children = true;
-      }
-    } else {
-      if (ts_tree_cursor_goto_next_sibling(&cursor)) {
-        already_visited_children = false;
-      } else {
-        if (!ts_tree_cursor_goto_parent(&cursor)) break;
-      }
-    }
-  }
-  ts_tree_cursor_delete(&cursor);
+  tree_sitter::descendants_of_type(node, tree_sitter::symbols_for_types(ts_tree_language(tree->tree), types),
+                                   start_point, end_point, &result);
 
   Array array = Array::New(env, result.size());
   for (size_t i = 0; i < result.size(); i++) array[i] = wrap(env, result[i]);
