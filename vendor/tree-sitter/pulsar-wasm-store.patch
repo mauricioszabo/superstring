@@ -1,0 +1,175 @@
+--- a/lib/src/wasm_store.c	2026-09-26 02:05:13.792818894 -0300
++++ b/lib/src/wasm_store.c	2026-09-26 02:05:13.804818785 -0300
+@@ -228,6 +228,18 @@
+       const uint8_t *name_end = p + name_length;
+       if (name_end > section_end) return false;
+ 
++      // Pulsar patch: grammars built with older emscripten versions carry a
++      // legacy `dylink` section, which holds the same memory and table info
++      // directly (no subsections).
++      if (name_length == 6 && memcmp(p, "dylink", 6) == 0) {
++        p = name_end;
++        info->memory_size = read_uleb128(&p, section_end);
++        info->memory_align = read_uleb128(&p, section_end);
++        info->table_size = read_uleb128(&p, section_end);
++        info->table_align = read_uleb128(&p, section_end);
++        return true;
++      }
++
+       if (name_length == 8 && memcmp(p, "dylink.0", 8) == 0) {
+         p = name_end;
+         while (p < section_end) {
+@@ -972,6 +984,80 @@
+   return self->current_memory_offset;
+ }
+ 
++// Pulsar patch: see `ts_wasm_store__instantiate`.
++typedef struct {
++  wasmtime_global_t global;
++  const wasm_name_t *name;
++  bool is_function;
++} GotEntry;
++
++static bool ts_wasm_store__resolve_got_entries(
++  TSWasmStore *self,
++  wasmtime_instance_t *instance,
++  uint32_t memory_base,
++  const void *entries_pointer,
++  char **error_message
++) {
++  const Array(GotEntry) *entries = entries_pointer;
++  wasmtime_context_t *context = wasmtime_store_context(self->store);
++  wasmtime_error_t *error = NULL;
++  uint32_t appended_functions = 0;
++
++  for (unsigned i = 0; i < entries->size; i++) {
++    const GotEntry *entry = &entries->contents[i];
++    wasmtime_extern_t export;
++    bool found = wasmtime_instance_export_get(
++      context, instance, entry->name->data, entry->name->size, &export
++    );
++    int32_t value;
++
++    if (entry->is_function) {
++      if (found && export.kind == WASMTIME_EXTERN_FUNC) {
++        // Give the function a slot in the shared table.
++        wasmtime_val_t function_ref = {.kind = WASMTIME_FUNCREF, .of.funcref = export.of.func};
++        uint64_t slot;
++        error = wasmtime_table_grow(context, &self->function_table, 1, &function_ref, &slot);
++        if (error) {
++          wasmtime_error_delete(error);
++          format(error_message, "failed to add GOT.func entry '%.*s'", (int)entry->name->size, entry->name->data);
++          return false;
++        }
++        appended_functions++;
++        value = (int32_t)slot;
++      } else {
++        bool in_stdlib = false;
++        for (unsigned j = 0; j < array_len(STDLIB_SYMBOLS); j++) {
++          if (name_eq(entry->name, STDLIB_SYMBOLS[j])) {
++            value = (int32_t)self->stdlib_fn_indices[j];
++            in_stdlib = true;
++            break;
++          }
++        }
++        if (!in_stdlib) {
++          format(error_message, "unresolved GOT.func entry '%.*s'", (int)entry->name->size, entry->name->data);
++          return false;
++        }
++      }
++    } else {
++      if (!found || export.kind != WASMTIME_EXTERN_GLOBAL) {
++        format(error_message, "unresolved GOT.mem entry '%.*s'", (int)entry->name->size, entry->name->data);
++        return false;
++      }
++      // Exported data symbols are offsets from the module's memory base.
++      wasmtime_val_t offset;
++      wasmtime_global_get(context, &export.of.global, &offset);
++      value = (int32_t)memory_base + offset.of.i32;
++    }
++
++    wasmtime_val_t global_value = WASM_I32_VAL(value);
++    error = wasmtime_global_set(context, &entry->global, &global_value);
++    ts_assert(!error);
++  }
++
++  self->current_function_table_offset += appended_functions;
++  return true;
++}
++
+ static bool ts_wasm_store__instantiate(
+   TSWasmStore *self,
+   wasmtime_module_t *module,
+@@ -1022,14 +1108,41 @@
+   wasmtime_module_imports(module, &import_types);
+   imports = ts_calloc(import_types.size, sizeof(wasmtime_extern_t));
+ 
++  // Pulsar patch: grammars whose external scanners were compiled without
++  // hidden visibility import the addresses of their own symbols through the
++  // global offset table (`GOT.func.*` / `GOT.mem.*`). Provide mutable globals
++  // for them now and fill them in once the module is instantiated.
++  const uint32_t memory_base = self->current_memory_offset;
++  Array(GotEntry) got_entries = array_new();
++  wasm_globaltype_t *mutable_i32_type = wasm_globaltype_new(wasm_valtype_new_i32(), WASM_VAR);
++
+   for (unsigned i = 0; i < import_types.size; i++) {
+     const wasm_importtype_t *import_type = import_types.data[i];
+     const wasm_name_t *import_name = wasm_importtype_name(import_type);
+     if (import_name->size == 0) {
+       format(error_message, "empty import name");
++      wasm_globaltype_delete(mutable_i32_type);
++      array_delete(&got_entries);
+       goto error;
+     }
+ 
++    const wasm_name_t *import_module = wasm_importtype_module(import_type);
++    bool is_got_func = import_module->size == 8 && memcmp(import_module->data, "GOT.func", 8) == 0;
++    bool is_got_mem = import_module->size == 7 && memcmp(import_module->data, "GOT.mem", 7) == 0;
++    if (is_got_func || is_got_mem) {
++      wasmtime_val_t zero = WASM_I32_VAL(0);
++      wasmtime_global_t global;
++      error = wasmtime_global_new(context, mutable_i32_type, &zero, &global);
++      ts_assert(!error);
++      imports[i] = (wasmtime_extern_t) {.kind = WASMTIME_EXTERN_GLOBAL, .of.global = global};
++      array_push(&got_entries, ((GotEntry) {
++        .global = global,
++        .name = import_name,
++        .is_function = is_got_func,
++      }));
++      continue;
++    }
++
+     if (ts_wasm_store__provide_builtin_import(self, import_name, &imports[i])) {
+       continue;
+     }
+@@ -1050,15 +1163,29 @@
+         "invalid import '%.*s'\n",
+         (int)import_name->size, import_name->data
+       );
++      wasm_globaltype_delete(mutable_i32_type);
++      array_delete(&got_entries);
+       goto error;
+     }
+   }
++  wasm_globaltype_delete(mutable_i32_type);
+ 
+   wasmtime_instance_t instance;
+   error = wasmtime_instance_new(context, module, imports, import_types.size, &instance, &trap);
+-  wasm_importtype_vec_delete(&import_types);
+   ts_free(imports);
+   imports = NULL;
++  if (!error && !trap) {
++    // Fill in the GOT entries before any initializer (data relocations may
++    // read them) runs. The import names stay valid until `import_types` is
++    // deleted.
++    if (!ts_wasm_store__resolve_got_entries(self, &instance, memory_base, &got_entries, error_message)) {
++      wasm_importtype_vec_delete(&import_types);
++      array_delete(&got_entries);
++      goto error;
++    }
++  }
++  wasm_importtype_vec_delete(&import_types);
++  array_delete(&got_entries);
+   if (error) {
+     wasmtime_error_message(error, &message);
+     format(

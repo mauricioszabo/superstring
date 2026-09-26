@@ -12,3 +12,4 @@ vendor/libiconv
 .atom
 .cache
 /bin/
+vendor/wasmtime

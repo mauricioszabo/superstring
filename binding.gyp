@@ -4,6 +4,7 @@
             "target_name": "superstring",
             "dependencies": [
                 "superstring_core",
+                "superstring_tree_sitter",
             ],
             "sources": [
                 "src/bindings/bindings.cc",
@@ -51,6 +52,89 @@
                     ]
                 }]
             ]
+        },
+        {
+            # Superstring's native Tree-sitter language mode.
+            "target_name": "superstring_tree_sitter",
+            "type": "static_library",
+            "dependencies": [
+                "superstring_core",
+                "tree_sitter",
+            ],
+            "export_dependent_settings": ["tree_sitter"],
+            "sources": [
+                "src/core/tree-sitter/wasm-engine.cc",
+            ],
+            "include_dirs": [
+                "src/core",
+            ],
+        },
+        {
+            # Native Tree-sitter with WASM grammar support (see
+            # vendor/tree-sitter/README.md). Wasmtime's C API is fetched by
+            # script/fetch-wasmtime.js.
+            "target_name": "tree_sitter",
+            "type": "static_library",
+            "sources": [
+                "vendor/tree-sitter/lib/src/lib.c",
+            ],
+            "include_dirs": [
+                "vendor/tree-sitter/lib/include",
+                "vendor/tree-sitter/lib/src",
+                "vendor/tree-sitter/lib/src/wasm",
+                "<(wasmtime_dir)/include",
+            ],
+            "defines": [
+                "TREE_SITTER_FEATURE_WASM",
+                "_POSIX_C_SOURCE=200112L",
+                "_DEFAULT_SOURCE",
+            ],
+            "cflags_c": ["-std=c11", "-fvisibility=hidden", "-Wno-unused-parameter"],
+            "xcode_settings": {
+                "OTHER_CFLAGS": ["-std=c11"],
+            },
+            "direct_dependent_settings": {
+                "include_dirs": [
+                    "vendor/tree-sitter/lib/include",
+                    "<(wasmtime_dir)/include",
+                ],
+                "defines": ["TREE_SITTER_FEATURE_WASM"],
+            },
+            "link_settings": {
+                "conditions": [
+                    ['OS=="linux"', {
+                        "libraries": [
+                            "<(wasmtime_dir)/lib/libwasmtime.a",
+                            "-lpthread",
+                            "-ldl",
+                            "-lm",
+                        ],
+                    }],
+                    ['OS=="mac"', {
+                        "libraries": ["<(wasmtime_dir)/lib/libwasmtime.a"],
+                    }],
+                    ['OS=="win"', {
+                        "libraries": [
+                            "<(wasmtime_dir)/lib/wasmtime.lib",
+                            "ws2_32.lib",
+                            "advapi32.lib",
+                            "userenv.lib",
+                            "ntdll.lib",
+                            "shell32.lib",
+                            "ole32.lib",
+                            "bcrypt.lib",
+                        ],
+                    }],
+                ],
+            },
+            "conditions": [
+                ['OS=="win"', {
+                    "defines": ["WASM_API_EXTERN=", "WASI_API_EXTERN="],
+                    "direct_dependent_settings": {
+                        "defines": ["WASM_API_EXTERN=", "WASI_API_EXTERN="],
+                    },
+                }],
+            ],
         },
         {
             "target_name": "superstring_core",
@@ -105,6 +189,7 @@
 
     "variables": {
         "tests": 0,
+        "wasmtime_dir%": "<!(node script/fetch-wasmtime.js)",
         "node_version_major%": "<!(node -p \"process.versions.node.split('.')[0]\")"
     },
 
@@ -153,6 +238,7 @@
                     "test/native/text-test.cc",
                     "test/native/text-diff-test.cc",
                     "test/native/display-layer-test.cc",
+                    "test/native/tree-sitter-test.cc",
                     "vendor/catch_amalgamated.cpp"
                 ],
                 "include_dirs": [
@@ -160,7 +246,8 @@
                     "src/core",
                 ],
                 "dependencies": [
-                    "superstring_core"
+                    "superstring_core",
+                    "superstring_tree_sitter",
                 ],
                 "conditions": [
                     ['node_version_major>=18', {
