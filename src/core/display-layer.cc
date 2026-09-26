@@ -110,6 +110,8 @@ DisplayLayer::DisplayLayer(const DisplayLayer &source, FoldsIndexProvider folds_
   spatial_index_{const_cast<Patch &>(source.spatial_index_).copy()},
   screen_line_lengths_{source.screen_line_lengths_},
   tab_counts_{source.tab_counts_},
+  wrap_overflow_offsets_{source.wrap_overflow_offsets_},
+  wrap_carried_widths_{source.wrap_carried_widths_},
   rightmost_screen_position_{source.rightmost_screen_position_},
   indexed_buffer_row_count_{source.indexed_buffer_row_count_},
   next_built_in_scope_id_{1},
@@ -137,6 +139,8 @@ void DisplayLayer::clear_spatial_index() {
   cached_screen_lines_.clear();
   screen_line_lengths_.clear();
   tab_counts_.clear();
+  wrap_overflow_offsets_.clear();
+  wrap_carried_widths_.clear();
   rightmost_screen_position_ = Point(0, 0);
 }
 
@@ -833,9 +837,15 @@ void DisplayLayer::buffer_will_change(uint32_t old_end_row) {
   invalidate_line_cache();
 }
 
-DisplayLayer::ScreenChange DisplayLayer::buffer_did_change(uint32_t start_row, uint32_t old_end_row,
-                                                           uint32_t new_end_row) {
+DisplayLayer::ScreenChange DisplayLayer::buffer_did_change(uint32_t start_row, uint32_t start_column,
+                                                           uint32_t old_end_row, uint32_t old_end_column,
+                                                           uint32_t new_end_row, uint32_t new_end_column) {
   invalidate_line_cache();
+
+  if (start_row == old_end_row && start_row == new_end_row) {
+    auto change = update_soft_wraps_in_row(start_row, start_column, old_end_column, new_end_column);
+    if (change) return *change;
+  }
 
   // Indent guides on sequences of blank lines are affected by the content of
   // adjacent lines.
@@ -1053,9 +1063,13 @@ DisplayLayer::ScreenChange DisplayLayer::update_spatial_index(uint32_t start_buf
 
   vector<uint32_t> inserted_screen_line_lengths;
   vector<uint32_t> inserted_tab_counts;
+  vector<int32_t> inserted_wrap_overflow_offsets;
+  vector<double> inserted_wrap_carried_widths;
   vector<int64_t> current_screen_line_tab_columns;
   int64_t rightmost_inserted_row = 0;
   int64_t rightmost_inserted_column = -1;
+  int32_t current_wrap_overflow_offset = -1;
+  double current_wrap_carried_width = 0;
   uint32_t buffer_row = start_buffer_row;
   uint32_t screen_row = start_screen_row;
   uint32_t buffer_column = 0;
@@ -1165,6 +1179,10 @@ DisplayLayer::ScreenChange DisplayLayer::update_spatial_index(uint32_t start_buf
         );
 
         inserted_screen_line_lengths.push_back(static_cast<uint32_t>(expanded_wrap_column));
+        inserted_wrap_overflow_offsets.push_back(current_wrap_overflow_offset);
+        inserted_wrap_carried_widths.push_back(current_wrap_carried_width);
+        current_wrap_overflow_offset = static_cast<int32_t>(unexpanded_screen_column - unexpanded_wrap_column);
+        current_wrap_carried_width = screen_line_width - wrap_width;
         if (expanded_wrap_column > rightmost_inserted_column) {
           rightmost_inserted_row = screen_row;
           rightmost_inserted_column = expanded_wrap_column;
@@ -1237,6 +1255,10 @@ DisplayLayer::ScreenChange DisplayLayer::update_spatial_index(uint32_t start_buf
     expanded_screen_column--;
     inserted_screen_line_lengths.push_back(static_cast<uint32_t>(expanded_screen_column));
     inserted_tab_counts.push_back(current_screen_line_tab_columns.size());
+    inserted_wrap_overflow_offsets.push_back(current_wrap_overflow_offset);
+    inserted_wrap_carried_widths.push_back(current_wrap_carried_width);
+    current_wrap_overflow_offset = -1;
+    current_wrap_carried_width = 0;
     if (expanded_screen_column > rightmost_inserted_column) {
       rightmost_inserted_row = screen_row;
       rightmost_inserted_column = expanded_screen_column;
@@ -1258,6 +1280,21 @@ DisplayLayer::ScreenChange DisplayLayer::update_spatial_index(uint32_t start_buf
   }
 
   uint32_t old_screen_row_count = old_end_screen_row - start_screen_row;
+  splice_screen_rows(start_screen_row, old_screen_row_count, inserted_screen_line_lengths,
+                     inserted_tab_counts, inserted_wrap_overflow_offsets, inserted_wrap_carried_widths,
+                     rightmost_inserted_row, rightmost_inserted_column);
+  return {start_screen_row, old_screen_row_count, static_cast<uint32_t>(inserted_screen_line_lengths.size())};
+}
+
+// Replaces the per-row data of `old_screen_row_count` screen rows starting at
+// `start_screen_row` and updates the rightmost position and the screen line
+// cache accordingly.
+void DisplayLayer::splice_screen_rows(uint32_t start_screen_row, uint32_t old_screen_row_count,
+                                      const vector<uint32_t> &inserted_screen_line_lengths,
+                                      const vector<uint32_t> &inserted_tab_counts,
+                                      const vector<int32_t> &inserted_wrap_overflow_offsets,
+                                      const vector<double> &inserted_wrap_carried_widths,
+                                      int64_t rightmost_inserted_row, int64_t rightmost_inserted_column) {
   uint32_t lengths_start = std::min<uint32_t>(start_screen_row, screen_line_lengths_.size());
   uint32_t lengths_removed = std::min<uint32_t>(old_screen_row_count, screen_line_lengths_.size() - lengths_start);
   screen_line_lengths_.erase(
@@ -1272,6 +1309,26 @@ DisplayLayer::ScreenChange DisplayLayer::update_spatial_index(uint32_t start_buf
   uint32_t tabs_removed = std::min<uint32_t>(old_screen_row_count, tab_counts_.size() - tabs_start);
   tab_counts_.erase(tab_counts_.begin() + tabs_start, tab_counts_.begin() + tabs_start + tabs_removed);
   tab_counts_.insert(tab_counts_.begin() + tabs_start, inserted_tab_counts.begin(), inserted_tab_counts.end());
+  uint32_t offsets_start = std::min<uint32_t>(start_screen_row, wrap_overflow_offsets_.size());
+  uint32_t offsets_removed = std::min<uint32_t>(old_screen_row_count, wrap_overflow_offsets_.size() - offsets_start);
+  wrap_overflow_offsets_.erase(
+    wrap_overflow_offsets_.begin() + offsets_start,
+    wrap_overflow_offsets_.begin() + offsets_start + offsets_removed
+  );
+  wrap_overflow_offsets_.insert(
+    wrap_overflow_offsets_.begin() + offsets_start,
+    inserted_wrap_overflow_offsets.begin(), inserted_wrap_overflow_offsets.end()
+  );
+  uint32_t widths_start = std::min<uint32_t>(start_screen_row, wrap_carried_widths_.size());
+  uint32_t widths_removed = std::min<uint32_t>(old_screen_row_count, wrap_carried_widths_.size() - widths_start);
+  wrap_carried_widths_.erase(
+    wrap_carried_widths_.begin() + widths_start,
+    wrap_carried_widths_.begin() + widths_start + widths_removed
+  );
+  wrap_carried_widths_.insert(
+    wrap_carried_widths_.begin() + widths_start,
+    inserted_wrap_carried_widths.begin(), inserted_wrap_carried_widths.end()
+  );
 
   uint32_t last_removed_screen_row = start_screen_row + old_screen_row_count;
   if (rightmost_inserted_column > static_cast<int64_t>(rightmost_screen_position_.column)) {
@@ -1288,8 +1345,334 @@ DisplayLayer::ScreenChange DisplayLayer::update_spatial_index(uint32_t start_buf
   }
 
   splice_cache(start_screen_row, old_screen_row_count, inserted_screen_line_lengths.size());
+}
 
-  return {start_screen_row, old_screen_row_count, static_cast<uint32_t>(inserted_screen_line_lengths.size())};
+// Re-wraps only the part of a soft-wrapped buffer row affected by an edit
+// within that row, instead of the whole row (which is linear in the length of
+// the line, and very slow when typing in long lines).
+//
+// Wrap decisions only depend on the text back to the previous wrap, so the
+// first screen row that can change is the one before the row containing the
+// edit. The wrapping state right after a wrap is determined by the wrap, its
+// indent, the character that overflowed the previous row and the width
+// carried over (which keeps the widths tabs had before the wrap); we store
+// the last two per screen row, so we can restart right there exactly. We
+// stop as soon as a wrap past the edit matches an old one (shifted by the
+// edit) in all of these: everything after it is unchanged.
+//
+// Returns nothing when the edit needs a full update: the row has folds or
+// isn't indexed yet, indent guides are shown, or the first non-whitespace
+// character isn't on the row's first screen row before the edit.
+optional<DisplayLayer::ScreenChange> DisplayLayer::update_soft_wraps_in_row(uint32_t row, uint32_t edit_start,
+                                                                           uint32_t old_edit_end, uint32_t new_edit_end) {
+  if (!std::isfinite(params_.soft_wrap_column) || params_.show_indent_guides) return optional<ScreenChange>{};
+  if (static_cast<int64_t>(row) >= indexed_buffer_row_count_) return optional<ScreenChange>{};
+  if (old_edit_end < edit_start || new_edit_end < edit_start) return optional<ScreenChange>{};
+
+  const u16string &line = line_for_row(row);
+  const int64_t line_length = line.size();
+  const int64_t delta = static_cast<int64_t>(new_edit_end) - static_cast<int64_t>(old_edit_end);
+  const int64_t old_line_length = line_length - delta;
+  if (old_line_length < old_edit_end) return optional<ScreenChange>{};
+
+  // The row's current layout, still in pre-edit buffer coordinates.
+  const uint32_t start_screen_row = translate_buffer_position_with_spatial_index(
+    Point(row, 0), ClipDirection::Backward
+  ).row;
+  const uint32_t end_screen_row = translate_buffer_position_with_spatial_index(
+    Point(row, static_cast<uint32_t>(old_line_length)), ClipDirection::Forward
+  ).row;
+  if (end_screen_row >= wrap_overflow_offsets_.size()) return optional<ScreenChange>{};
+  vector<Patch::Change> wraps;
+  for (auto &hunk : spatial_index_.grab_changes_in_new_range(Point(start_screen_row, 0), Point(end_screen_row + 1, 0))) {
+    if (hunk.old_start.row > row || hunk.old_end.row < row) continue;
+    if (!is_soft_wrap_hunk(hunk)) return optional<ScreenChange>{};  // A fold touches this row.
+    wraps.push_back(hunk);
+  }
+  if (end_screen_row - start_screen_row != wraps.size()) return optional<ScreenChange>{};
+  // The overflow offset of the row starting at wraps[i] is at
+  // wrap_overflow_offsets_[start_screen_row + i + 1].
+  auto overflow_offset_after_wrap = [&](size_t i) {
+    return wrap_overflow_offsets_[start_screen_row + i + 1];
+  };
+  auto carried_width_after_wrap = [&](size_t i) {
+    return wrap_carried_widths_[start_screen_row + i + 1];
+  };
+  if (end_screen_row >= wrap_carried_widths_.size()) return optional<ScreenChange>{};
+
+  const double soft_wrap_column = params_.soft_wrap_column;
+  const int64_t tab_length = params_.tab_length;
+  const double space_ratio = ratio_for_character(' ');
+
+  // The screen row (within this buffer row) containing the edit, and the one
+  // before it: the first that can change.
+  size_t edit_screen_row = 0;
+  while (edit_screen_row < wraps.size() && wraps[edit_screen_row].old_start.column <= edit_start) edit_screen_row++;
+  size_t restart_screen_row = edit_screen_row > 0 ? edit_screen_row - 1 : 0;
+
+  // Restarting after a wrap needs the expanded column of the first
+  // non-whitespace character, which must lie before the first wrap and the
+  // edit.
+  int64_t first_non_whitespace_screen_column = -1;
+  if (restart_screen_row > 0) {
+    int64_t expanded = 0;
+    int64_t column = 0;
+    for (; column < line_length; column++) {
+      if (line[column] == ' ') expanded++;
+      else if (line[column] == '\t') expanded += tab_length - (expanded % tab_length);
+      else break;
+    }
+    if (column >= line_length || column >= edit_start || column >= wraps[0].old_start.column ||
+        overflow_offset_after_wrap(restart_screen_row - 1) < 0) {
+      restart_screen_row = 0;
+    } else {
+      first_non_whitespace_screen_column = expanded;
+    }
+  }
+
+  const int64_t restart_column = restart_screen_row > 0 ? wraps[restart_screen_row - 1].old_start.column : 0;
+  const int64_t restart_indent = restart_screen_row > 0 ? wraps[restart_screen_row - 1].new_end.column : 0;
+  const int32_t restart_overflow_offset = restart_screen_row > 0 ? overflow_offset_after_wrap(restart_screen_row - 1) : -1;
+  const double restart_carried_width = restart_screen_row > 0 ? carried_width_after_wrap(restart_screen_row - 1) : 0;
+  // After a wrap, the full algorithm continues with the overflowing character
+  // (without checking it again), so that is where we resume.
+  const int64_t scan_column = restart_screen_row > 0 ? restart_column + restart_overflow_offset : 0;
+  if (scan_column > line_length) return optional<ScreenChange>{};
+
+  struct NewWrap {
+    uint32_t screen_row;
+    uint32_t unexpanded_column;
+    uint32_t indent;
+  };
+  vector<NewWrap> new_wraps;
+  vector<uint32_t> inserted_screen_line_lengths;
+  vector<uint32_t> inserted_tab_counts;
+  vector<int32_t> inserted_wrap_overflow_offsets;
+  vector<double> inserted_wrap_carried_widths;
+  vector<int64_t> current_screen_line_tab_columns;
+  int64_t rightmost_inserted_row = 0;
+  int64_t rightmost_inserted_column = -1;
+  size_t next_old_wrap = edit_screen_row;
+  optional<size_t> resync_wrap;
+  int32_t current_wrap_overflow_offset = restart_overflow_offset;
+  double current_wrap_carried_width = restart_carried_width;
+
+  // Rebuild the state right after the wrap starting the restart row, as the
+  // full algorithm left it: the characters up to the overflowing one are on
+  // this row, their tabs re-expanded after the indent.
+  uint32_t screen_row = start_screen_row + restart_screen_row;
+  int64_t unexpanded_screen_column = restart_indent + (scan_column - restart_column);
+  int64_t expanded_screen_column;
+  {
+    int64_t unexpanded_screen_column_after_last_tab = restart_indent;
+    int64_t expanded_screen_column_after_last_tab = restart_indent;
+    for (int64_t column = restart_column; column < scan_column; column++) {
+      if (line[column] == '\t') {
+        int64_t tab_column = restart_indent + (column - restart_column);
+        current_screen_line_tab_columns.push_back(tab_column);
+        expanded_screen_column_after_last_tab += tab_column - unexpanded_screen_column_after_last_tab;
+        expanded_screen_column_after_last_tab += tab_length - (expanded_screen_column_after_last_tab % tab_length);
+        unexpanded_screen_column_after_last_tab = tab_column + 1;
+      }
+    }
+    expanded_screen_column = expanded_screen_column_after_last_tab + unexpanded_screen_column - unexpanded_screen_column_after_last_tab;
+  }
+  double screen_line_width = (restart_indent * space_ratio) + restart_carried_width;
+  int64_t last_wrap_boundary_unexpanded_screen_column = 0;
+  int64_t last_wrap_boundary_expanded_screen_column = 0;
+  double last_wrap_boundary_screen_line_width = 0;
+  const int64_t unchecked_column = restart_screen_row > 0 ? scan_column : -1;
+
+  // Mirrors the per-character loop of update_spatial_index (without folds).
+  for (int64_t buffer_column = scan_column; buffer_column <= line_length; buffer_column++) {
+    const bool checked = buffer_column != unchecked_column;
+    bool has_previous_character = buffer_column > 0;
+    uint16_t previous_character = has_previous_character ? line[buffer_column - 1] : 0;
+    bool has_character = buffer_column < line_length;
+    uint16_t character = has_character ? line[buffer_column] : 0;
+    bool character_is_tab = has_character && character == '\t';
+    bool character_is_space = has_character && character == ' ';
+
+    if (first_non_whitespace_screen_column < 0) {
+      if (!character_is_space && !character_is_tab) {
+        first_non_whitespace_screen_column = expanded_screen_column;
+      }
+    } else if (checked && has_previous_character && has_character &&
+               is_wrap_boundary(previous_character, character, false)) {
+      last_wrap_boundary_unexpanded_screen_column = unexpanded_screen_column;
+      last_wrap_boundary_expanded_screen_column = expanded_screen_column;
+      last_wrap_boundary_screen_line_width = screen_line_width;
+    }
+
+    double character_width;
+    if (character_is_tab) {
+      character_width = space_ratio * (tab_length - (expanded_screen_column % tab_length));
+    } else if (has_character) {
+      character_width = ratio_for_character(character);
+    } else {
+      character_width = 0;
+    }
+
+    bool insert_soft_line_break =
+      checked &&
+      screen_line_width > 0 && character_width > 0 &&
+      screen_line_width + character_width > soft_wrap_column &&
+      has_previous_character && has_character &&
+      !character_classes::is_character_pair(previous_character, character);
+
+    if (insert_soft_line_break) {
+      int64_t indent_length = (first_non_whitespace_screen_column < soft_wrap_column)
+        ? std::max<int64_t>(0, first_non_whitespace_screen_column)
+        : 0;
+      if (indent_length + params_.soft_wrap_hanging_indent < soft_wrap_column) {
+        indent_length += params_.soft_wrap_hanging_indent;
+      }
+
+      int64_t unexpanded_wrap_column = last_wrap_boundary_unexpanded_screen_column
+        ? last_wrap_boundary_unexpanded_screen_column : unexpanded_screen_column;
+      int64_t expanded_wrap_column = last_wrap_boundary_expanded_screen_column
+        ? last_wrap_boundary_expanded_screen_column : expanded_screen_column;
+      double wrap_width = last_wrap_boundary_screen_line_width
+        ? last_wrap_boundary_screen_line_width : screen_line_width;
+      int64_t wrap_buffer_column = buffer_column - (unexpanded_screen_column - unexpanded_wrap_column);
+      int32_t overflow_offset = static_cast<int32_t>(unexpanded_screen_column - unexpanded_wrap_column);
+      double carried_width = screen_line_width - wrap_width;
+
+      size_t tab_count_preceding_wrap = 0;
+      for (int64_t tab_column : current_screen_line_tab_columns) {
+        if (tab_column < unexpanded_wrap_column) tab_count_preceding_wrap++;
+      }
+
+      inserted_screen_line_lengths.push_back(static_cast<uint32_t>(expanded_wrap_column));
+      inserted_tab_counts.push_back(tab_count_preceding_wrap);
+      inserted_wrap_overflow_offsets.push_back(current_wrap_overflow_offset);
+      inserted_wrap_carried_widths.push_back(current_wrap_carried_width);
+      if (expanded_wrap_column > rightmost_inserted_column) {
+        rightmost_inserted_row = screen_row;
+        rightmost_inserted_column = expanded_wrap_column;
+      }
+
+      // Past the edit, a wrap identical to an old one means the rest of the
+      // row is unchanged.
+      if (wrap_buffer_column >= new_edit_end) {
+        int64_t old_column = wrap_buffer_column - delta;
+        while (next_old_wrap < wraps.size() && wraps[next_old_wrap].old_start.column < old_column) next_old_wrap++;
+        if (next_old_wrap < wraps.size() &&
+            wraps[next_old_wrap].old_start.column == old_column &&
+            wraps[next_old_wrap].new_end.column == indent_length &&
+            overflow_offset_after_wrap(next_old_wrap) == overflow_offset &&
+            carried_width_after_wrap(next_old_wrap) == carried_width) {
+          resync_wrap = next_old_wrap;
+          break;
+        }
+      }
+
+      new_wraps.push_back({screen_row, static_cast<uint32_t>(unexpanded_wrap_column), static_cast<uint32_t>(indent_length)});
+      current_wrap_overflow_offset = overflow_offset;
+      current_wrap_carried_width = carried_width;
+      screen_row++;
+
+      int64_t unexpanded_screen_column_after_last_tab = indent_length;
+      int64_t expanded_screen_column_after_last_tab = indent_length;
+      tab_count_preceding_wrap = 0;
+      for (size_t i = 0; i < current_screen_line_tab_columns.size(); i++) {
+        int64_t tab_column = current_screen_line_tab_columns[i];
+        if (tab_column < unexpanded_wrap_column) {
+          tab_count_preceding_wrap++;
+        } else {
+          int64_t tab_column_after_wrap = indent_length + tab_column - unexpanded_wrap_column;
+          expanded_screen_column_after_last_tab += tab_column_after_wrap - unexpanded_screen_column_after_last_tab;
+          expanded_screen_column_after_last_tab += tab_length - (expanded_screen_column_after_last_tab % tab_length);
+          unexpanded_screen_column_after_last_tab = tab_column_after_wrap + 1;
+          current_screen_line_tab_columns[i - tab_count_preceding_wrap] = tab_column_after_wrap;
+        }
+      }
+      current_screen_line_tab_columns.resize(current_screen_line_tab_columns.size() - tab_count_preceding_wrap);
+
+      unexpanded_screen_column = unexpanded_screen_column - unexpanded_wrap_column + indent_length;
+      expanded_screen_column = expanded_screen_column_after_last_tab + unexpanded_screen_column - unexpanded_screen_column_after_last_tab;
+      screen_line_width = (indent_length * space_ratio) + (screen_line_width - wrap_width);
+
+      last_wrap_boundary_unexpanded_screen_column = 0;
+      last_wrap_boundary_expanded_screen_column = 0;
+      last_wrap_boundary_screen_line_width = 0;
+    }
+
+    if (character_is_tab) {
+      current_screen_line_tab_columns.push_back(unexpanded_screen_column);
+      int64_t distance_to_next_tab_stop = tab_length - (expanded_screen_column % tab_length);
+      expanded_screen_column += distance_to_next_tab_stop;
+      screen_line_width += distance_to_next_tab_stop * space_ratio;
+    } else {
+      expanded_screen_column++;
+      screen_line_width += character_width;
+    }
+    unexpanded_screen_column++;
+  }
+
+  if (!resync_wrap) {
+    expanded_screen_column--;
+    inserted_screen_line_lengths.push_back(static_cast<uint32_t>(expanded_screen_column));
+    inserted_tab_counts.push_back(current_screen_line_tab_columns.size());
+    inserted_wrap_overflow_offsets.push_back(current_wrap_overflow_offset);
+    inserted_wrap_carried_widths.push_back(current_wrap_carried_width);
+    if (expanded_screen_column > rightmost_inserted_column) {
+      rightmost_inserted_row = screen_row;
+      rightmost_inserted_column = expanded_screen_column;
+    }
+  }
+
+  // Replace the wraps strictly between the restart point and the resync point
+  // (or the end of the row); spliceOld keeps the wraps at both ends.
+  int64_t old_end_column = resync_wrap ? static_cast<int64_t>(wraps[*resync_wrap].old_start.column) : old_line_length;
+  spatial_index_.splice_old(
+    Point(row, static_cast<uint32_t>(restart_column)),
+    Point(0, static_cast<uint32_t>(old_end_column - restart_column)),
+    Point(0, static_cast<uint32_t>(old_end_column + delta - restart_column))
+  );
+  for (auto &wrap : new_wraps) {
+    spatial_index_.splice(Point(wrap.screen_row, wrap.unexpanded_column), Point(0, 0), Point(1, wrap.indent));
+  }
+
+  uint32_t first_changed_screen_row = start_screen_row + restart_screen_row;
+  uint32_t old_screen_row_count = (resync_wrap ? *resync_wrap : wraps.size()) - restart_screen_row + 1;
+  uint32_t new_screen_row_count = inserted_screen_line_lengths.size();
+  splice_screen_rows(first_changed_screen_row, old_screen_row_count, inserted_screen_line_lengths,
+                     inserted_tab_counts, inserted_wrap_overflow_offsets, inserted_wrap_carried_widths,
+                     rightmost_inserted_row, rightmost_inserted_column);
+  ScreenChange change{first_changed_screen_row, old_screen_row_count, new_screen_row_count};
+
+  // Whether a space is rendered as trailing whitespace depends on the end of
+  // the line. That can only change if nothing but whitespace follows the
+  // edit, and then only for spaces after the whitespace preceding the edit:
+  // re-render from there to the end of the row.
+  int64_t trailing_whitespace_start = line_length;
+  while (trailing_whitespace_start > 0 &&
+         (line[trailing_whitespace_start - 1] == ' ' || line[trailing_whitespace_start - 1] == '\t')) {
+    trailing_whitespace_start--;
+  }
+  if (trailing_whitespace_start <= new_edit_end) {
+    int64_t whitespace_before_edit = edit_start;
+    while (whitespace_before_edit > 0 &&
+           (line[whitespace_before_edit - 1] == ' ' || line[whitespace_before_edit - 1] == '\t')) {
+      whitespace_before_edit--;
+    }
+    uint32_t affected_start_row = translate_buffer_position_with_spatial_index(
+      Point(row, static_cast<uint32_t>(std::min(whitespace_before_edit, trailing_whitespace_start))),
+      ClipDirection::Backward
+    ).row;
+    uint32_t new_end_screen_row = translate_buffer_position_with_spatial_index(
+      Point(row, static_cast<uint32_t>(line_length)), ClipDirection::Forward
+    ).row + 1;
+    uint32_t start = std::min(affected_start_row, change.start);
+    uint32_t new_extent = new_end_screen_row - start;
+    uint32_t old_extent = new_extent + old_screen_row_count - new_screen_row_count;
+    for (uint32_t screen_row = start; screen_row < new_end_screen_row && screen_row < cached_screen_lines_.size(); screen_row++) {
+      cached_screen_lines_[screen_row].reset();
+    }
+    change = ScreenChange{start, old_extent, new_extent};
+  }
+  return change;
 }
 
 // Screen lines

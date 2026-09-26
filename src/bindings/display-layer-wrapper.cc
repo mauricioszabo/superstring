@@ -315,11 +315,15 @@ void DisplayLayerWrapper::buffer_will_change(const CallbackInfo &info) {
   display_layer->buffer_will_change(coordinate_from_js(info[0]));
 }
 
+// bufferDidChange(startRow, startColumn, oldEndRow, oldEndColumn, newEndRow, newEndColumn)
 void DisplayLayerWrapper::buffer_did_change(const CallbackInfo &info) {
   write_change(display_layer->buffer_did_change(
     coordinate_from_js(info[0]),
     coordinate_from_js(info[1]),
-    coordinate_from_js(info[2])
+    coordinate_from_js(info[2]),
+    coordinate_from_js(info[3]),
+    coordinate_from_js(info[4]),
+    coordinate_from_js(info[5])
   ));
 }
 

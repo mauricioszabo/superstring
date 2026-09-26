@@ -129,7 +129,9 @@ public:
                                     uint32_t new_end_buffer_row, uint32_t end_screen_row,
                                     const TimeRemaining *time_remaining = nullptr);
   void buffer_will_change(uint32_t old_end_row);
-  ScreenChange buffer_did_change(uint32_t start_row, uint32_t old_end_row, uint32_t new_end_row);
+  ScreenChange buffer_did_change(uint32_t start_row, uint32_t start_column,
+                                 uint32_t old_end_row, uint32_t old_end_column,
+                                 uint32_t new_end_row, uint32_t new_end_column);
   ScreenChange invalidate_highlighting(uint32_t start_row, uint32_t end_row);
 
   Point translate_buffer_position(double row, double column, ClipDirection clip_direction);
@@ -218,6 +220,14 @@ private:
   int32_t built_in_scope_id_for_flags(int32_t flags);
   bool append_line_html(const ScreenLine &line, std::u16string *html, std::vector<int32_t> *missing_scope_ids);
   void splice_cache(uint32_t start, uint32_t old_count, uint32_t new_count);
+  void splice_screen_rows(uint32_t start_screen_row, uint32_t old_screen_row_count,
+                          const std::vector<uint32_t> &inserted_screen_line_lengths,
+                          const std::vector<uint32_t> &inserted_tab_counts,
+                          const std::vector<int32_t> &inserted_wrap_overflow_offsets,
+                          const std::vector<double> &inserted_wrap_carried_widths,
+                          int64_t rightmost_inserted_row, int64_t rightmost_inserted_column);
+  optional<ScreenChange> update_soft_wraps_in_row(uint32_t row, uint32_t edit_start,
+                                                  uint32_t old_edit_end, uint32_t new_edit_end);
 
   TextBuffer *buffer_;
   FoldsIndexProvider folds_index_;
@@ -225,6 +235,14 @@ private:
   Patch spatial_index_;
   std::vector<uint32_t> screen_line_lengths_;
   std::vector<uint32_t> tab_counts_;
+  // For each screen row that starts at a soft wrap, how many unexpanded
+  // columns past the wrap the character that overflowed the previous row is
+  // (the wrapping state after a wrap depends on it); -1 for rows that start a
+  // buffer row.
+  std::vector<int32_t> wrap_overflow_offsets_;
+  // For the same rows, the width carried over from the previous row at the
+  // wrap (the full algorithm keeps the widths tabs had before the wrap).
+  std::vector<double> wrap_carried_widths_;
   Point rightmost_screen_position_;
   int64_t indexed_buffer_row_count_;
   std::vector<std::unique_ptr<ScreenLine>> cached_screen_lines_;

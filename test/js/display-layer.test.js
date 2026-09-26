@@ -67,7 +67,7 @@ describe('DisplayLayer', () => {
     displayLayer.getScreenLineCount()
     displayLayer.bufferWillChange(1)
     buffer.setTextInRange({start: {row: 1, column: 0}, end: {row: 1, column: 1}}, 'x\ny')
-    displayLayer.bufferDidChange(1, 1, 2)
+    displayLayer.bufferDidChange(1, 0, 1, 1, 2, 1)
     assert.deepEqual([scratch[0], scratch[1], scratch[2]], [1, 1, 2])
     assert.deepEqual(getScreenLineTexts(displayLayer, 0, 4), ['a', 'x', 'y', 'c'])
   })

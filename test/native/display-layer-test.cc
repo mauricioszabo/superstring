@@ -92,7 +92,7 @@ TEST_CASE("DisplayLayer - reuses cached screen lines until the buffer changes") 
 
   layer.buffer_will_change(1);
   buffer.set_text_in_range({{1, 0}, {1, 3}}, u"xyz");
-  auto change = layer.buffer_did_change(1, 1, 1);
+  auto change = layer.buffer_did_change(1, 0, 1, 3, 1, 3);
   REQUIRE(change.start == 1);
   REQUIRE(change.old_extent == 1);
   REQUIRE(change.new_extent == 1);
