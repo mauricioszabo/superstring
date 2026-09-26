@@ -56,6 +56,36 @@ inline uint32_t to_coordinate(double value) {
 }
 
 inline bool is_open_tag(int32_t tag) { return tag < 0 && (tag & 1) == 1; }
+
+// Mirrors `classNameForBuiltInFlags` in text-buffer's display-layer.js.
+u16string class_name_for_built_in_flags(int32_t flags) {
+  u16string class_name;
+  auto add = [&](const char16_t *name) {
+    if (!class_name.empty()) class_name += u' ';
+    class_name += name;
+  };
+  if (flags & INVISIBLE_CHARACTER) add(u"invisible-character");
+  if (flags & HARD_TAB) add(u"hard-tab");
+  if (flags & LEADING_WHITESPACE) add(u"leading-whitespace");
+  if (flags & TRAILING_WHITESPACE) add(u"trailing-whitespace");
+  if (flags & LINE_ENDING) add(u"eol");
+  if (flags & INDENT_GUIDE) add(u"indent-guide");
+  if (flags & FOLD) add(u"fold-marker");
+  return class_name;
+}
+
+void append_escaped_html(u16string *html, const char16_t *text, size_t length) {
+  for (size_t i = 0; i < length; i++) {
+    char16_t c = text[i];
+    switch (c) {
+      case '&': *html += u"&amp;"; break;
+      case '<': *html += u"&lt;"; break;
+      case '>': *html += u"&gt;"; break;
+      case '"': *html += u"&quot;"; break;
+      default: html->push_back(c);
+    }
+  }
+}
 inline int32_t open_tag_for_scope_id(int32_t scope_id) { return -scope_id; }
 inline int32_t close_tag_for_scope_id(int32_t scope_id) { return -scope_id - 1; }
 
@@ -638,7 +668,135 @@ int32_t DisplayLayer::built_in_scope_id_for_flags(int32_t flags) {
   int32_t scope_id = next_built_in_scope_id_;
   built_in_scope_ids_by_flags_.emplace(flags, scope_id);
   new_built_in_scopes_.push_back({scope_id, flags});
+  class_names_by_scope_id_[scope_id] = class_name_for_built_in_flags(flags);
   return scope_id;
+}
+
+// Render plans
+
+void DisplayLayer::set_class_name(int32_t scope_id, u16string class_name) {
+  class_names_by_scope_id_[scope_id] = std::move(class_name);
+}
+
+uint32_t DisplayLayer::create_render_planner() {
+  uint32_t id = next_render_planner_id_++;
+  render_planners_[id];
+  return id;
+}
+
+void DisplayLayer::destroy_render_planner(uint32_t planner_id) {
+  render_planners_.erase(planner_id);
+}
+
+// Produces the same DOM that Pulsar's LineComponent builds from the tags:
+// a root <span> with a nested <span class="..."> per scope and text nodes for
+// the text runs, plus a space for empty lines and a zero-width no-break space
+// after a trailing fold marker.
+bool DisplayLayer::append_line_html(const ScreenLine &line, u16string *html,
+                                    vector<int32_t> *missing_scope_ids) {
+  bool complete = true;
+  *html += u"<span>";
+  size_t column = 0;
+  for (int32_t tag : line.tags) {
+    if (tag > 0) {
+      size_t length = std::min<size_t>(tag, line.text.size() - column);
+      append_escaped_html(html, line.text.data() + column, length);
+      column += length;
+    } else if (tag < 0) {
+      if (is_open_tag(tag)) {
+        int32_t scope_id = -tag;
+        auto entry = class_names_by_scope_id_.find(scope_id);
+        if (entry == class_names_by_scope_id_.end()) {
+          missing_scope_ids->push_back(scope_id);
+          complete = false;
+          *html += u"<span>";
+        } else {
+          *html += u"<span class=\"";
+          append_escaped_html(html, entry->second.data(), entry->second.size());
+          *html += u"\">";
+        }
+      } else {
+        *html += u"</span>";
+      }
+    }
+  }
+  *html += u"</span>";
+  if (column == 0) *html += u' ';
+  auto &fold_character = params_.fold_character;
+  if (!fold_character.empty() && line.text.size() >= fold_character.size() &&
+      line.text.compare(line.text.size() - fold_character.size(), fold_character.size(), fold_character) == 0) {
+    *html += u'\uFEFF';
+  }
+  return complete;
+}
+
+bool DisplayLayer::build_render_plan(uint32_t planner_id, uint32_t start_row,
+                                     const vector<const ScreenLine *> &lines,
+                                     RenderPlan *plan, vector<int32_t> *missing_scope_ids) {
+  auto &previous = render_planners_[planner_id];
+
+  std::unordered_map<uint32_t, uint32_t> previous_row_by_id;
+  std::unordered_map<uint32_t, uint32_t> previous_id_by_row;
+  previous_row_by_id.reserve(previous.size());
+  previous_id_by_row.reserve(previous.size());
+  for (auto &rendered : previous) {
+    previous_row_by_id[rendered.id] = rendered.row;
+    previous_id_by_row[rendered.row] = rendered.id;
+  }
+
+  std::unordered_map<uint32_t, bool> current_ids;
+  current_ids.reserve(lines.size());
+  for (auto line : lines) current_ids[line->id] = true;
+
+  std::unordered_map<uint32_t, bool> replaced_ids;
+  for (size_t i = 0; i < lines.size(); i++) {
+    const ScreenLine &line = *lines[i];
+    uint32_t row = start_row + i;
+    auto previous_row = previous_row_by_id.find(line.id);
+    if (previous_row != previous_row_by_id.end()) {
+      uint32_t op = previous_row->second == row ? RENDER_OP_KEEP : RENDER_OP_MOVE;
+      plan->ops.insert(plan->ops.end(), {op, line.id, row, 0});
+      continue;
+    }
+
+    uint32_t op = RENDER_OP_INSERT;
+    uint32_t old_id = 0;
+    auto previous_id = previous_id_by_row.find(row);
+    if (previous_id != previous_id_by_row.end() &&
+        !current_ids.count(previous_id->second) &&
+        !replaced_ids.count(previous_id->second)) {
+      op = RENDER_OP_REPLACE;
+      old_id = previous_id->second;
+      replaced_ids[old_id] = true;
+    }
+    plan->ops.insert(plan->ops.end(), {op, line.id, row, old_id});
+
+    u16string html;
+    append_line_html(line, &html, missing_scope_ids);
+    plan->html_line_ids.push_back(line.id);
+    plan->html.push_back(std::move(html));
+  }
+
+  if (!missing_scope_ids->empty()) {
+    std::sort(missing_scope_ids->begin(), missing_scope_ids->end());
+    missing_scope_ids->erase(
+      std::unique(missing_scope_ids->begin(), missing_scope_ids->end()),
+      missing_scope_ids->end()
+    );
+    return false;
+  }
+
+  for (auto &rendered : previous) {
+    if (!current_ids.count(rendered.id) && !replaced_ids.count(rendered.id)) {
+      plan->ops.insert(plan->ops.end(), {RENDER_OP_REMOVE, rendered.id, rendered.row, 0});
+    }
+  }
+
+  previous.clear();
+  for (size_t i = 0; i < lines.size(); i++) {
+    previous.push_back({static_cast<uint32_t>(start_row + i), lines[i]->id});
+  }
+  return true;
 }
 
 vector<DisplayLayer::BuiltInScope> DisplayLayer::take_new_built_in_scopes() {

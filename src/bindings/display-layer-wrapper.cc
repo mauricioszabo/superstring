@@ -134,6 +134,10 @@ void DisplayLayerWrapper::init(Napi::Env env, Object exports) {
     InstanceMethod<&DisplayLayerWrapper::get_computed_screen_line_count>("getComputedScreenLineCount", napi_default_method),
     InstanceMethod<&DisplayLayerWrapper::prepare_screen_lines>("prepareScreenLines", napi_default_method),
     InstanceMethod<&DisplayLayerWrapper::build_screen_lines>("buildScreenLines", napi_default_method),
+    InstanceMethod<&DisplayLayerWrapper::create_render_planner>("createRenderPlanner", napi_default_method),
+    InstanceMethod<&DisplayLayerWrapper::destroy_render_planner>("destroyRenderPlanner", napi_default_method),
+    InstanceMethod<&DisplayLayerWrapper::set_class_names>("setClassNames", napi_default_method),
+    InstanceMethod<&DisplayLayerWrapper::build_render_plan>("buildRenderPlan", napi_default_method),
   });
 
   exports.Set("DisplayLayer", func);
@@ -420,34 +424,49 @@ Napi::Value DisplayLayerWrapper::prepare_screen_lines(const CallbackInfo &info) 
 // the contents is for `ids[dataIndexes[j]]`, with tags
 // `tags[tagOffsets[j]..tagOffsets[j + 1]]`.
 Napi::Value DisplayLayerWrapper::build_screen_lines(const CallbackInfo &info) {
+  vector<const DisplayLayer::ScreenLine *> lines;
+  Napi::Value result = build_lines(info, 0, &lines);
+  if (!result.IsArray()) return result;
+  return screen_lines_to_js(info.Env(), lines, info[3]);
+}
+
+// Builds screen lines from (startRow, endRow, highlightBatch, knownIds,
+// strict) starting at `info[offset]`. Returns an empty array on success,
+// null if highlight segments did not match, or undefined after throwing.
+Napi::Value DisplayLayerWrapper::build_lines(const CallbackInfo &info, size_t offset,
+                                             vector<const DisplayLayer::ScreenLine *> *lines) {
   Napi::Env env = info.Env();
-  uint32_t start_row = coordinate_from_js(info[0]);
-  uint32_t end_row = coordinate_from_js(info[1]);
+  uint32_t start_row = coordinate_from_js(info[offset]);
+  uint32_t end_row = coordinate_from_js(info[offset + 1]);
 
   vector<DisplayLayer::HighlightSegment> segments;
-  if (!decode_highlight_batch(info[2], &segments)) {
+  if (!decode_highlight_batch(info[offset + 2], &segments)) {
     Error::New(env, "Invalid highlight batch").ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
-  const uint32_t *known_ids = nullptr;
-  size_t known_id_count = 0;
-  if (info[3].IsTypedArray()) {
-    auto known = info[3].As<Uint32Array>();
-    known_ids = known.Data();
-    known_id_count = known.ElementLength();
-  }
-
-  bool strict = info[4].ToBoolean();
-
-  vector<const DisplayLayer::ScreenLine *> lines;
-  if (!display_layer->build_screen_lines(start_row, end_row, segments, strict, &lines)) {
+  bool strict = info[offset + 4].ToBoolean();
+  if (!display_layer->build_screen_lines(start_row, end_row, segments, strict, lines)) {
     return env.Null();
   }
 
   if (display_layer->built_in_scope_ids_exhausted()) {
     Error::New(env, "Built in scope ids exhausted").ThrowAsJavaScriptException();
     return env.Undefined();
+  }
+  return Array::New(env, 0);
+}
+
+// Encodes screen lines as [ids, dataIndexes, texts, tagOffsets, tags,
+// softWrapIndents, newBuiltInScopes]; see `build_screen_lines`.
+Napi::Array DisplayLayerWrapper::screen_lines_to_js(Napi::Env env, const vector<const DisplayLayer::ScreenLine *> &lines,
+                                                    Napi::Value known_ids_value) {
+  const uint32_t *known_ids = nullptr;
+  size_t known_id_count = 0;
+  if (known_ids_value.IsTypedArray()) {
+    auto known = known_ids_value.As<Uint32Array>();
+    known_ids = known.Data();
+    known_id_count = known.ElementLength();
   }
 
   auto ids = Uint32Array::New(env, lines.size());
@@ -495,5 +514,60 @@ Napi::Value DisplayLayerWrapper::build_screen_lines(const CallbackInfo &info) {
   result[4u] = tags;
   result[5u] = soft_wrap_indents;
   result[6u] = new_built_in_scopes;
+  return result;
+}
+
+Napi::Value DisplayLayerWrapper::create_render_planner(const CallbackInfo &info) {
+  return Number::New(info.Env(), display_layer->create_render_planner());
+}
+
+void DisplayLayerWrapper::destroy_render_planner(const CallbackInfo &info) {
+  display_layer->destroy_render_planner(coordinate_from_js(info[0]));
+}
+
+// setClassNames(scopeIds, classNames)
+void DisplayLayerWrapper::set_class_names(const CallbackInfo &info) {
+  if (!info[0].IsTypedArray() || !info[1].IsArray()) return;
+  auto scope_ids = info[0].As<Int32Array>();
+  auto class_names = info[1].As<Array>();
+  for (size_t i = 0; i < scope_ids.ElementLength() && i < class_names.Length(); i++) {
+    Napi::Value class_name = class_names[i];
+    display_layer->set_class_name(
+      scope_ids[i],
+      class_name.IsString() ? class_name.As<String>().Utf16Value() : u16string()
+    );
+  }
+}
+
+// buildRenderPlan(plannerId, startRow, endRow, highlightBatch, knownIds, strict)
+//   -> null (highlight segments did not match; prepare again),
+//      an Int32Array of scope ids whose class names must be set first, or
+//      the `buildScreenLines` result followed by
+//      [ops, htmlLineIds, html]: ops are (op, lineId, row, oldLineId)
+//      quadruples (see DisplayLayer::RenderOp) and html[i] is the contents
+//      of the line element for htmlLineIds[i].
+Napi::Value DisplayLayerWrapper::build_render_plan(const CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  uint32_t planner_id = coordinate_from_js(info[0]);
+  uint32_t start_row = coordinate_from_js(info[1]);
+
+  vector<const DisplayLayer::ScreenLine *> lines;
+  Napi::Value built = build_lines(info, 1, &lines);
+  if (!built.IsArray()) return built;
+
+  DisplayLayer::RenderPlan plan;
+  vector<int32_t> missing_scope_ids;
+  if (!display_layer->build_render_plan(planner_id, start_row, lines, &plan, &missing_scope_ids)) {
+    return typed_array_from_vector<int32_t, Int32Array>(env, missing_scope_ids);
+  }
+
+  Napi::Array result = screen_lines_to_js(env, lines, info[4]);
+  auto html = Array::New(env, plan.html.size());
+  for (size_t i = 0; i < plan.html.size(); i++) {
+    html[i] = String::New(env, plan.html[i]);
+  }
+  result[7u] = typed_array_from_vector<uint32_t, Uint32Array>(env, plan.ops);
+  result[8u] = typed_array_from_vector<uint32_t, Uint32Array>(env, plan.html_line_ids);
+  result[9u] = html;
   return result;
 }

@@ -92,6 +92,21 @@ public:
     int32_t flags;
   };
 
+  // Render plan operations, emitted as (op, line id, screen row, old line id).
+  enum RenderOp : uint32_t {
+    RENDER_OP_KEEP = 0,     // Same line at the same row.
+    RENDER_OP_INSERT = 1,   // New line; its HTML is included.
+    RENDER_OP_REPLACE = 2,  // New line reusing the node of `old line id`, which left this row; HTML included.
+    RENDER_OP_MOVE = 3,     // Same line at a different row.
+    RENDER_OP_REMOVE = 4    // Line no longer rendered.
+  };
+
+  struct RenderPlan {
+    std::vector<uint32_t> ops;
+    std::vector<uint32_t> html_line_ids;
+    std::vector<std::u16string> html;
+  };
+
   using FoldsIndexProvider = std::function<MarkerIndex *()>;
   // Returns the milliseconds left before the caller's deadline.
   using TimeRemaining = std::function<double()>;
@@ -148,6 +163,19 @@ public:
                           const std::vector<HighlightSegment> &segments, bool strict,
                           std::vector<const ScreenLine *> *result);
   const ScreenLine *cached_screen_line(uint32_t screen_row) const;
+
+  // Render planners remember the rows each viewer rendered last, so that
+  // `build_render_plan` can describe only what changed.
+  uint32_t create_render_planner();
+  void destroy_render_planner(uint32_t planner_id);
+  // Diffs `lines` (the screen lines for rows starting at `start_row`) against
+  // what the planner rendered last and generates HTML for new lines. Returns
+  // false, leaving the planner untouched, if a class name is unknown; the
+  // missing scope ids are added to `missing_scope_ids`.
+  bool build_render_plan(uint32_t planner_id, uint32_t start_row,
+                         const std::vector<const ScreenLine *> &lines,
+                         RenderPlan *plan, std::vector<int32_t> *missing_scope_ids);
+  void set_class_name(int32_t scope_id, std::u16string class_name);
   std::vector<BuiltInScope> take_new_built_in_scopes();
   bool built_in_scope_ids_exhausted() const { return built_in_scope_ids_exhausted_; }
 
@@ -187,6 +215,7 @@ private:
   std::vector<MarkerIndex::MarkerId> find_folds_intersecting(MarkerIndex *index, uint32_t start_row,
                                                              uint32_t end_row);
   int32_t built_in_scope_id_for_flags(int32_t flags);
+  bool append_line_html(const ScreenLine &line, std::u16string *html, std::vector<int32_t> *missing_scope_ids);
   void splice_cache(uint32_t start, uint32_t old_count, uint32_t new_count);
 
   TextBuffer *buffer_;
@@ -202,6 +231,14 @@ private:
   std::unordered_map<int32_t, int32_t> built_in_scope_ids_by_flags_;
   int32_t next_built_in_scope_id_;
   std::vector<BuiltInScope> new_built_in_scopes_;
+  std::unordered_map<int32_t, std::u16string> class_names_by_scope_id_;
+
+  struct RenderedLine {
+    uint32_t row;
+    uint32_t id;
+  };
+  std::unordered_map<uint32_t, std::vector<RenderedLine>> render_planners_;
+  uint32_t next_render_planner_id_ = 1;
   bool built_in_scope_ids_exhausted_;
 
   std::vector<double> ratio_cache_;

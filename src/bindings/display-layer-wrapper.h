@@ -44,6 +44,15 @@ private:
   Napi::Value get_computed_screen_line_count(const Napi::CallbackInfo &info);
   Napi::Value prepare_screen_lines(const Napi::CallbackInfo &info);
   Napi::Value build_screen_lines(const Napi::CallbackInfo &info);
+  Napi::Value create_render_planner(const Napi::CallbackInfo &info);
+  void destroy_render_planner(const Napi::CallbackInfo &info);
+  void set_class_names(const Napi::CallbackInfo &info);
+  Napi::Value build_render_plan(const Napi::CallbackInfo &info);
+
+  Napi::Value build_lines(const Napi::CallbackInfo &info, size_t offset,
+                          std::vector<const DisplayLayer::ScreenLine *> *lines);
+  Napi::Array screen_lines_to_js(Napi::Env env, const std::vector<const DisplayLayer::ScreenLine *> &lines,
+                                 Napi::Value known_ids);
 
   std::unique_ptr<DisplayLayer> display_layer;
   // Weak: the JS DisplayLayer keeps these alive, and strong references would
