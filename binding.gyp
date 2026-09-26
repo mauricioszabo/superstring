@@ -7,6 +7,7 @@
             ],
             "sources": [
                 "src/bindings/bindings.cc",
+                "src/bindings/display-layer-wrapper.cc",
                 "src/bindings/marker-index-wrapper.cc",
                 "src/bindings/patch-wrapper.cc",
                 "src/bindings/point-wrapper.cc",
@@ -58,6 +59,7 @@
                 "./vendor/pcre/pcre.gyp:pcre"
             ],
             "sources": [
+                "src/core/display-layer.cc",
                 "src/core/encoding-conversion.cc",
                 "src/core/marker-index.cc",
                 "src/core/patch.cc",
@@ -150,6 +152,7 @@
                     "test/native/text-buffer-test.cc",
                     "test/native/text-test.cc",
                     "test/native/text-diff-test.cc",
+                    "test/native/display-layer-test.cc",
                     "vendor/catch_amalgamated.cpp"
                 ],
                 "include_dirs": [

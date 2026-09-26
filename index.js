@@ -354,4 +354,5 @@ module.exports = {
   TextBuffer: binding.TextBuffer,
   Patch: binding.Patch,
   MarkerIndex: binding.MarkerIndex,
+  DisplayLayer: binding.DisplayLayer,
 }

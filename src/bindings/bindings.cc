@@ -1,4 +1,5 @@
 #include "addon-data.h"
+#include "display-layer-wrapper.h"
 #include "marker-index-wrapper.h"
 #include "patch-wrapper.h"
 #include "range-wrapper.h"
@@ -19,6 +20,7 @@ Object Init(Env env, Object exports) {
   TextWriter::init(env, exports);
   TextReader::init(env, exports);
   TextBufferSnapshotWrapper::init(env);
+  DisplayLayerWrapper::init(env, exports);
   return exports;
 }
 
